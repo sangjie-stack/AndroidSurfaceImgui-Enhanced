@@ -21,6 +21,7 @@ namespace anti_extra {
 //   SEC_SECCOMP=0/1       L1.24 seccomp-bpf 禁危险 syscall（默认开）
 //   SEC_LIBC=0/1          L1.25 libc inline-hook 检测（默认开）
 //   SEC_MEMWATCH=0/1      L1.26 inotify 反内存 dump（默认开）
+//   SEC_UNICORN=0/1       L1.27 反 Unicorn 模拟器（默认开）
 struct SecurityConfig {
     bool enable_injected   = true;
     bool enable_memfd      = true;
@@ -31,6 +32,7 @@ struct SecurityConfig {
     bool enable_seccomp    = true;
     bool enable_libc       = true;
     bool enable_memwatch   = true;
+    bool enable_unicorn    = true;
     int  delay_min = 20;          // L1.14 延迟退出窗口下限(秒)
     int  delay_max = 90;          // L1.14 延迟退出窗口上限(秒)
     int  thread_baseline = -1;    // L1.17 线程基线（-1=未定，首个周期自动设定）
@@ -101,6 +103,13 @@ bool libc_hook_check();
 //        不监控 maps（自身检测会自读 maps，避免误报；且 maps 非直接内存 dump 面）。
 //        main() 早期启动独立监控线程；命中 → arm_detected()（走延迟退出）。
 void start_mem_watch_thread();
+
+// L1.27: 反 Unicorn 模拟器（Unicorn/QEMU 系 CPU 模拟——攻击者摘代码段模拟执行）。
+//        检测点（用户态 EL0 可读，真机永不误杀）：
+//          ① CNTVCT_EL0 虚拟计数器两次读取相等 → 假时钟（真机硬件时钟必递增）；
+//          ② faccessat2(439)/openat2(437) 返回 ENOSYS 且内核 >= 5.10 → Unicorn 无 syscall hook。
+//       返回 true=非模拟；false=疑似 Unicorn 模拟环境。
+bool unicorn_check();
 
 // L1.16: 检测规则数据自校验（白名单前缀表等关键常量哈希比对）。
 //        首次调用记录基线哈希；此后重算比对，不一致 = 检测逻辑被 patch。

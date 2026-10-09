@@ -69,6 +69,7 @@ void load_sec_cfg_from_env() {
     g_cfg.enable_seccomp    = env_bool("SEC_SECCOMP", true);
     g_cfg.enable_libc       = env_bool("SEC_LIBC", true);
     g_cfg.enable_memwatch   = env_bool("SEC_MEMWATCH", true);
+    g_cfg.enable_unicorn    = env_bool("SEC_UNICORN", true);
     int lo = g_cfg.delay_min, hi = g_cfg.delay_max;
     if (parse_range(::getenv("SEC_DELAY"), lo, hi)) { g_cfg.delay_min = lo; g_cfg.delay_max = hi; }
     int base = env_int("SEC_THRDBASE", -1);
@@ -754,6 +755,52 @@ void start_mem_watch_thread() {
     if (pthread_create(&t, nullptr, mem_watch_thread_fn, nullptr) == 0) {
         pthread_detach(t);
     }
+}
+
+// ---------- L1.27: 反 Unicorn 模拟器 ----------
+// Unicorn 是基于 QEMU 的 CPU 模拟引擎，攻击者用它"摘出代码段在 PC 上模拟执行"
+// 来绕过动态检测 / 逆 T3 验证 / dump 后分析。用户态（EL0）可用的区分点：
+//   ① CNTVCT_EL0（虚拟计数器，EL0 可读）：真实硬件每次读取必严格递增；
+//      Unicorn 常返回固定/假值 → 两次读取相等 = 假时钟。
+//   ② 新 syscall faccessat2(439)/openat2(437)：Android 5.10+ 内核支持；
+//      Unicorn 无对应 hook → ENOSYS(-38)。先读内核版本（>=5.10 才判，防老内核误杀）。
+// 说明：真机上这两条路径都是正常行为（计数器递增 / syscall 成功）→ 永不误杀；
+//       被 Unicorn 模拟时环境异常 → arm_detected 延迟退出。
+AMICE_FLATTEN_H /*L2AMICE*/
+bool unicorn_check() {
+    if (!g_cfg.enable_unicorn) return true;
+
+    // ① CNTVCT_EL0 两次读取相等 → 假时钟（真实硬件不可能相等）
+    uint64_t t0 = 0, t1 = 0;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t0));
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t1));
+    if (t0 == t1)
+        return false; // 计数器静止 = 模拟时钟
+
+    // ② 内核 >= 5.10 时，faccessat2(439)/openat2(437) 返回 ENOSYS → Unicorn 无 hook
+    {
+        static int kernel_ok = -1; // -1 未判定, 0 不可用, 1 可用
+        if (kernel_ok < 0) {
+            kernel_ok = 0;
+            char rel[128] = {0};
+            std::string kr;
+            if (syscall_read_proc("/proc/sys/kernel/osrelease", kr)) {
+                // 形如 "5.10.101-android13-..."；取前两段数字
+                unsigned maj = 0, min = 0;
+                if (sscanf(kr.c_str(), "%u.%u", &maj, &min) == 2)
+                    if (maj > 5 || (maj == 5 && min >= 10)) kernel_ok = 1;
+            }
+        }
+        if (kernel_ok == 1) {
+            errno = 0;
+            long r1 = ::syscall(439, AT_FDCWD, "/", F_OK, 0);          // faccessat2
+            if (r1 == -1 && errno == ENOSYS) return false;
+            errno = 0;
+            long r2 = ::syscall(437, AT_FDCWD, "/", 0, 0);              // openat2
+            if (r2 == -1 && errno == ENOSYS) return false;
+        }
+    }
+    return true;
 }
 
 // ---------- L1.16: 检测规则数据自校验 ----------
