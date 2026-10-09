@@ -1128,28 +1128,29 @@ bool slowdown_check() {
 // 壳厂 anti-dump 惯例：检测命中后向内存撒垃圾——攻击者 dump 到的是毒数据。
 // 实现：常驻 64KB 诱饵区（arm 前是伪随机填充，攻击者分析也无用；arm 后再随机化一次）。
 // 独立 LCG 随机源（不依赖文件后部的 xorshift32，避免声明顺序耦合）。
+// 审查修复（B16）：g_bait_init/g_poison_xs 原为普通变量——memwatch 线程与检测线程
+// 同时 arm_detected() 时有数据竞争（同写不同步）。原子化修复；`__builtin___clear_cache`
+// 对数据缓冲区无意义（报告指出），移除。
 namespace {
 uint8_t g_bait[65536];
-bool g_bait_init = false;
-uint32_t g_poison_xs = 0x85ebca6bu ^ static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_poison_xs));
+std::atomic<bool> g_bait_init{false};
+std::atomic<uint32_t> g_poison_xs{0x85ebca6bu ^ static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_poison_xs))};
 static uint32_t poison_xs() {
-    uint32_t x = g_poison_xs;
+    uint32_t x = g_poison_xs.load(std::memory_order_relaxed);
     x ^= x << 13; x ^= x >> 17; x ^= x << 5;
-    g_poison_xs = x;
+    g_poison_xs.store(x, std::memory_order_relaxed);
     return x;
 }
 } // namespace
 
 void poison_memory() {
     if (!g_cfg.enable_poison) return;
-    if (!g_bait_init) {
+    if (!g_bait_init.load(std::memory_order_relaxed)) {
         for (size_t i = 0; i < sizeof(g_bait); ++i) g_bait[i] = static_cast<uint8_t>(poison_xs());
-        g_bait_init = true;
+        g_bait_init.store(true, std::memory_order_relaxed);
     }
-    // 每次命中都重新随机化诱饵区
+    // 每次命中都重新随机化诱饵区（多线程并发 arm 时重复填充无害——同一随机源最终一致）
     for (size_t i = 0; i < sizeof(g_bait); ++i) g_bait[i] = static_cast<uint8_t>(poison_xs());
-    __builtin___clear_cache(reinterpret_cast<char*>(g_bait),
-                            reinterpret_cast<char*>(g_bait) + sizeof(g_bait));
 }
 
 // ---------- L1.16: 检测规则数据自校验 ----------

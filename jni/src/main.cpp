@@ -124,7 +124,13 @@ int main(int argc, char *argv[]) {
     anti_extra::apply_seccomp_filter();
     // L3: 反调试/反Frida 初始化（配置保持最小化，检测由下方显式调用）
     gt_config_t gt_cfg = {}; // C++ 聚合初始化（含枚举成员，不能用 {0}）
-    gt_cfg.stealth_mode = 1; // 静默模式：不打印 GhostTrace 自身标识
+    // 审查修复（B17）：gt_cfg={} 会把 detection_flags/enable_memory_protection 清零
+    // （gt_init 对非空 config 整体 memcpy 覆盖默认值）→ "以为开着"的检测位实际是关的。
+    // 显式赋全开检测位 + 显式关掉不用的项（内存保护——anti_extra 自有完整性自检/freeze
+    // 覆盖，GT 内存保护无实际使用处）。
+    gt_cfg.detection_flags = GT_DETECT_ALL;  // B17: 显式全开 GhostTrace 检测位
+    gt_cfg.enable_memory_protection = 0;     // B17: 显式关（无使用处；自有防线覆盖）
+    gt_cfg.stealth_mode = 1;                 // 静默模式：不打印 GhostTrace 自身标识
     gt_init(&gt_cfg);
     // 审查修复（B18）：启动期检测命中不再立即 return 0——秒级"启动即退"会让攻击者
     // 快速二分定位启动期检测点。统一走 arm_detected() 延迟退出（20~90s 随机静默退出），
