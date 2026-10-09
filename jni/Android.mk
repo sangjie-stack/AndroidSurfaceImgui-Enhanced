@@ -38,6 +38,8 @@ LOCAL_C_INCLUDES += $(LOCAL_PATH)/include/ImGui
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/include/ImGui/backends
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/include/ImGui/misc/freetype
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/include/ImGui/misc/git_freetype
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/include/t3sdk
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/src/Android_verify   # t3_gate.h 所在目录（main.cpp 依赖）
 
 
 
@@ -67,6 +69,9 @@ LOCAL_SRC_FILES += src/ghosttrace/ghosttrace_memory.c
 LOCAL_SRC_FILES += src/ghosttrace/ghosttrace_process.c
 LOCAL_SRC_FILES += src/ghosttrace/ghosttrace_breakpoints.c
 LOCAL_SRC_FILES += src/ghosttrace/ghosttrace_android.c
+LOCAL_SRC_FILES += src/security_extra/anti_extra.cpp  #L1.6/L1.8/L1.9: 完整性自检+dumpable+反Frida多向量
+LOCAL_SRC_FILES += src/t3sdk/t3sdk.cpp               #T3验证SDK(纯C++, 无OpenSSL依赖)
+LOCAL_SRC_FILES += src/t3_gate.cpp    #T3卡密验证门禁(密钥AY_OBFUSCATE加密)
     
 
 
