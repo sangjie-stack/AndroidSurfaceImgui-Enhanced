@@ -10,9 +10,15 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#ifdef __aarch64__
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <linux/audit.h>
+#endif
 
 #include <fstream>
 #include <sstream>
@@ -58,6 +64,8 @@ void load_sec_cfg_from_env() {
     g_cfg.enable_integrity  = env_bool("SEC_INTEGRITY", true);
     g_cfg.enable_tracerpid  = env_bool("SEC_TRACER", true);
     g_cfg.enable_selfcheck  = env_bool("SEC_SELFCHK", true);
+    g_cfg.enable_seccomp    = env_bool("SEC_SECCOMP", true);
+    g_cfg.enable_libc       = env_bool("SEC_LIBC", true);
     int lo = g_cfg.delay_min, hi = g_cfg.delay_max;
     if (parse_range(::getenv("SEC_DELAY"), lo, hi)) { g_cfg.delay_min = lo; g_cfg.delay_max = hi; }
     int base = env_int("SEC_THRDBASE", -1);
@@ -527,6 +535,168 @@ bool relro_check() {
         std::string perms = line.substr(p1 + 1, line.find(' ', p1 + 1) - p1 - 1);
         if (perms.find('w') != std::string::npos)
             return false; // RELRO 只读段被解除为可写 = PLT hook 企图
+    }
+    return true;
+}
+
+// ---------- L1.24: seccomp-bpf 禁危险 syscall（防注入路径 + 限制被注入后 agent 能力） ----------
+// 参考 Android zygote seccomp policy / MSeccomp 思路：
+//   - memfd_create(319): frida agent 在本进程内建 memfd 可执行映射的路径。
+//     禁掉后 frida 只能 fallback tmpfile+dlopen → 非白名单可执行段 → injected_check 双保险。
+//   - process_vm_readv(270)/writev(271): 远程读写本进程内存（gdb/注入器常用）。
+//   - perf_event_open(241): 侧信道采样。
+// 注意：不禁 ptrace（GhostTrace 的 PTRACE_TRACEME 自占位 / PEEKDATA 反调试需要）。
+// 失败/未开启 → 放行（保守，不阻断启动）。
+void apply_seccomp_filter() {
+#ifdef __aarch64__
+    if (!g_cfg.enable_seccomp) return;
+    struct sock_filter filter[] = {
+        // 加载系统调用号
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        // memfd_create
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 319, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        // process_vm_readv
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 270, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        // process_vm_writev
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 271, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        // perf_event_open
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 241, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        // 其余放行
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+    struct sock_fprog prog;
+    prog.len = static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0]));
+    prog.filter = filter;
+    // PR_SET_NO_NEW_PRIVS 必须在 PR_SET_SECCOMP 前设置
+    if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) return;
+    if (::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0) != 0) return;
+#endif
+}
+
+// ---------- L1.25: libc inline-hook 检测 ----------
+// 参考 TUGOhost/anti_Android：frida 的 hook 核心是对目标 libc 的 mmap/dlopen/dlsym 等
+// 做 inline hook（改函数头为跳转）。完整性自检只管自身 .text，libc 被 hook 是盲区。
+// 检测：运行时读 libc 函数头 8 字节 vs 磁盘 /system/lib64/libc.so 对应偏移原始值。
+// 手写逐字节比较（不依赖 libc memcmp——自身可能被 hook）。
+namespace {
+struct LibcFnSnap {
+    uintptr_t run_addr;   // 运行时函数地址（dlsym）
+    uintptr_t seg_base;   // 所在 libc 段运行起始
+    uint64_t  seg_file_off;
+    unsigned char disk[8]; // 磁盘原始 8 字节
+};
+std::vector<LibcFnSnap> g_libc_snap;
+bool g_libc_parsed = false;
+
+static bool read_mem_bytes(uintptr_t addr, unsigned char out[8]) {
+    // 手写逐字节读（绕过可能被 hook 的 libc memcpy）
+    volatile const unsigned char* p = reinterpret_cast<volatile const unsigned char*>(addr);
+    for (int i = 0; i < 8; ++i) out[i] = p[i];
+    return true;
+}
+static bool bytes_equal(const unsigned char a[8], const unsigned char b[8]) {
+    for (int i = 0; i < 8; ++i) if (a[i] != b[i]) return false;
+    return true;
+}
+} // namespace
+
+AMICE_FLATTEN_H /*L2AMICE*/
+bool libc_hook_check() {
+    if (!g_cfg.enable_libc) return true;
+    if (!g_libc_parsed) {
+        // 首次：定位 libc.so 各段 + 目标函数运行时地址
+        const char* kFns[] = { "open", "read", "fopen", "ioctl", "mmap", "mprotect" };
+        std::string data;
+        if (!syscall_read_proc("/proc/self/maps", data)) return true;
+        std::istringstream mss(data);
+        std::string line;
+        struct SegInfo { uintptr_t start, end; uint64_t file_off; };
+        std::vector<SegInfo> libc_segs;
+        while (std::getline(mss, line)) {
+            size_t p0 = line.find('-');
+            if (p0 == std::string::npos) continue;
+            size_t p1 = line.find(' ', p0);
+            if (p1 == std::string::npos) continue;
+            size_t p2 = line.find(' ', p1 + 1);
+            if (p2 == std::string::npos) continue;
+            std::string perms = line.substr(p1 + 1, p2 - p1 - 1);
+            if (perms.find('x') == std::string::npos) continue; // 只要可执行段
+            size_t p3 = line.find(' ', p2 + 1);
+            if (p3 == std::string::npos) continue;
+            uint64_t off = strtoull(line.substr(p2 + 1, p3 - p2 - 1).c_str(), nullptr, 16);
+            size_t p4 = line.find(' ', p3 + 1), p5 = line.find(' ', p4 + 1);
+            if (p5 == std::string::npos) continue;
+            std::string path;
+            if (p5 + 1 < line.size()) path = line.substr(p5 + 1);
+            size_t pb = path.find_first_not_of(" \t");
+            if (pb == std::string::npos) continue;
+            path = path.substr(pb);
+            if (path.find("libc.so") == std::string::npos) continue;
+            uintptr_t start = strtoull(line.substr(0, p0).c_str(), nullptr, 16);
+            uintptr_t end = strtoull(line.substr(p0 + 1, p1 - p0 - 1).c_str(), nullptr, 16);
+            libc_segs.push_back({start, end, off});
+        }
+        if (libc_segs.empty()) return true;
+
+        // 磁盘 libc 文件 fd（定向读各偏移原始字节）
+        std::string libc_path;
+        {
+            std::string data2;
+            if (!syscall_read_proc("/proc/self/maps", data2)) return true;
+            std::istringstream m2(data2);
+            while (std::getline(m2, line)) {
+                if (line.find("libc.so") == std::string::npos) continue;
+                size_t pb = line.find_last_of(' ');
+                if (pb == std::string::npos) continue;
+                std::string p = line.substr(pb + 1);
+                size_t q = p.find_first_not_of(" \t");
+                if (q != std::string::npos) p = p.substr(q);
+                if (!p.empty()) { libc_path = p; break; }
+            }
+        }
+        if (libc_path.empty()) return true;
+        int fdf = ::open(libc_path.c_str(), O_RDONLY);
+        if (fdf < 0) return true;
+
+        bool ok = true;
+        for (const char* fn : kFns) {
+            void* sym = dlsym(RTLD_DEFAULT, fn);
+            if (!sym) continue;
+            uintptr_t addr = reinterpret_cast<uintptr_t>(sym);
+            // 找 addr 所在 libc 段
+            const SegInfo* hit = nullptr;
+            for (const auto& s : libc_segs) {
+                if (addr >= s.start && addr < s.end) { hit = &s; break; }
+            }
+            if (!hit) continue;
+            uint64_t disk_off = hit->file_off + (addr - hit->start);
+            unsigned char disk[8] = {0};
+            if (::lseek(fdf, static_cast<off_t>(disk_off), SEEK_SET) < 0) { ok = false; break; }
+            size_t got = 0;
+            while (got < 8) {
+                ssize_t r = ::read(fdf, disk + got, 8 - got);
+                if (r <= 0) { ok = false; break; }
+                got += static_cast<size_t>(r);
+            }
+            if (!ok) break;
+            g_libc_snap.push_back({addr, hit->start, hit->file_off, {disk[0],disk[1],disk[2],disk[3],disk[4],disk[5],disk[6],disk[7]}});
+        }
+        ::close(fdf);
+        if (!ok || g_libc_snap.empty()) return true;
+        g_libc_parsed = true;
+        return true; // 首次调用只建快照（不判）
+    }
+
+    // 周期比对：内存 prologue vs 磁盘原始
+    for (const auto& s : g_libc_snap) {
+        unsigned char mem[8] = {0};
+        read_mem_bytes(s.run_addr, mem);
+        if (!bytes_equal(mem, s.disk))
+            return false; // libc 函数头被改 = inline hook
     }
     return true;
 }

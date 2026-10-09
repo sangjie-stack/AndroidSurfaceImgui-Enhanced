@@ -64,6 +64,7 @@ static void fast_security_check() {
     if (!anti_extra::thread_spike_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::tracerpid_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::relro_check()) { anti_extra::arm_detected(); return; }
+    if (!anti_extra::libc_hook_check()) { anti_extra::arm_detected(); return; }
 }
 
 // 慢周期重检测（开销大：完整性自检读磁盘 ~2.9MB 逐段 memcmp；规则哈希重算）
@@ -108,6 +109,8 @@ int main(int argc, char *argv[]) {
     anti_extra::load_sec_cfg_from_env();
     // L1.8: 禁止其他进程读取本进程内存（须在一切初始化之前）
     anti_extra::set_dumpable();
+    // L1.24: seccomp-bpf 禁危险 syscall（须早期：memfd 注入路径关闭/限制 agent 能力）
+    anti_extra::apply_seccomp_filter();
     // L3: 反调试/反Frida 初始化（配置保持最小化，检测由下方显式调用）
     gt_config_t gt_cfg = {}; // C++ 聚合初始化（含枚举成员，不能用 {0}）
     gt_cfg.stealth_mode = 1; // 静默模式：不打印 GhostTrace 自身标识
