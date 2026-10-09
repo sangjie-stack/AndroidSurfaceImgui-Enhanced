@@ -1,17 +1,28 @@
-// entangle_decode.cpp -- 服务端密钥纠缠: 解码器 + 失败时的静默处置
+// entangle_decode.cpp -- 服务端密钥纠缠: 纯解码器 (v2)
 //
 // 防线逻辑(与 crackme 攻防实测同型):
-//   正确密钥 -> 解出合法配置(magic/tag 对上) -> 业务用 cfg
-//   错误密钥(patch 门禁/无服务器/控制台未配 core) -> 垃圾 -> 延迟随机秒数后 _exit
-//   (延迟+静默: 不给攻击者"改这里就过了"的即时反馈)
-#include "entangled_cfg.h"
+//   正确密钥 -> 解出合法配置(密钥化CRC对上) -> 业务消费 cfg
+//   错误密钥(patch 门禁/无服务器/控制台未配 core) -> 垃圾 -> 调用方武装延迟退出
+//
+// v2 (审计 P0-2 修复): 旧版 magic(0x5A17C0DE)/tag("T3OK") 是与密文同二进制的
+// 已知明文——攻击者 XOR 出 8 字节密钥流即可格攻击还原 LCG 状态, 整条密钥派生
+// 被旁路。现改为 crc32(tick^flags^spare^key低32位), 校验值依赖密钥, 二进制内
+// 不存在任何"明文-密文"对。惩罚策略(延迟退出)移至 t3_gate.cpp——本文件只做
+// 密码学, 不做策略。
+#include "amice_annotate.h" //L2: amice 混淆注解
+#include "entangle_decode.h"
+
 #include <cstdint>
 #include <cstring>
-#include <cstdlib>
-#include <unistd.h>
 
 namespace t3 {
 
+// VMP 注解: fnv1a64 是密钥派生根函数(core+appkey→session key), 循环内活跃值
+// ~3 个, 符合 VMP 画像(同探针 f6 字符串循环)。加载 amice 插件时虚拟化为字节码;
+// 未加载时注解被忽略, 零影响。
+// 注意: entangle_decode 本体实测爆寄存器墙(O2 下 16 字节展开 >31 活跃值),
+// 保持明指令, Flatten 由调用方(t3_gate)覆盖。
+AMICE_VMP /*L2AMICE*/
 static uint64_t fnv1a64(const char* s) {
     uint64_t h = 0xcbf29ce484222325ull;
     for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
@@ -21,29 +32,37 @@ static uint64_t fnv1a64(const char* s) {
     return h;
 }
 
+// IEEE CRC-32 (poly 0xEDB88320 反射, init/xorout 0xFFFFFFFF) —— 与 python zlib.crc32 一致
+// 逐位实现: 无查表(表本身也是可定位的静态指纹), 4 字节输入开销可忽略
+static uint32_t crc32_ieee(const uint8_t* p, uint32_t n) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < n; i++) {
+        crc ^= p[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
 // 由登录响应 core + APPKEY 派生会话密钥 (与 gen_entangle.py 完全一致)
+AMICE_FLATTEN_H /*L2AMICE*/
 uint64_t derive_session_key(const char* core, const char* appkey) {
     return fnv1a64(core ? core : "") ^ fnv1a64(appkey ? appkey : "");
 }
 
+// 解码 ENC_CFG 并做密钥化CRC校验 (与 gen_entangle.py 的 ecc 公式一致)
 bool entangle_decode(uint64_t key, EntangledCfg* out) {
     uint64_t x = key;
-    uint8_t dec[20];
-    for (int i = 0; i < 20; i++) {
+    uint8_t dec[sizeof(ENC_CFG)];
+    for (size_t i = 0; i < sizeof(ENC_CFG); i++) {
         x = x * 6364136223846793005ull + 1442695040888963407ull;
         dec[i] = ENC_CFG[i] ^ (uint8_t)(x >> 33);
     }
-    __builtin_memcpy(out, dec, 20);
-    return out->magic == 0x5A17C0DEu && out->tag[0]=='T' && out->tag[1]=='3'
-        && out->tag[2]=='O' && out->tag[3]=='K';
-}
-
-// 解码失败: 延迟随机 3~9 秒后静默退出 (不给即时反馈, 退出码 0 伪装正常退出)
-void entangle_punish() {
-    uintptr_t addr = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
-    srand((unsigned)(addr & 0xFFFFFFFFu));
-    usleep((3000000u + ((unsigned)rand() % 6000000u)));
-    _exit(0);
+    __builtin_memcpy(out, dec, sizeof(dec));
+    // 密钥化校验: ecc = crc32_le32(tick ^ draw_flags ^ spare ^ key低32位)
+    uint32_t v = out->security_tick ^ out->draw_flags ^ out->spare ^ (uint32_t)key;
+    uint8_t ecc_in[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
+    return crc32_ieee(ecc_in, 4) == out->ecc;
 }
 
 } // namespace t3

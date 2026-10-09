@@ -12,14 +12,20 @@ namespace t3 {
 bool verify_and_run();
 
 // —— 服务端密钥纠缠(anti patch-bypass) ——
-// verify_and_run() 成功后可用: 由登录响应 core + APPKEY 派生的会话密钥。
-// 门禁被 patch 跳过时(未发生真实登录)返回 false —— 调用方应静默退出。
+// verify_and_run() 成功后可用: 实际解开 ENC_CFG 的那个会话密钥(主候选或
+// hex 解码候选)。仅真实登录才拿得到 core; 门禁被 patch 时返回 false。
 bool session_key(uint64_t* out);
 
-// 解码内嵌加密配置(EntangledCfg 见 entangled_cfg.h); 失败即延迟静默退出
+// 解码内嵌加密配置(v2 密钥化CRC校验, 见 entangled_cfg.h)。
+// 失败时不再返回 false: 武装 anti_extra 延迟退出(20~90s 随机)并返回 true
+// 伪装通过——垃圾配置流入下方消费接口, 检测行为悄悄劣化后静默退出。
 bool entangle_or_die();
 
-// 解码后的安全复检周期(帧) — 仅在 entangle_or_die() 成功后有效
+// —— 解码配置的消费者接口(审计 P0-1) ——
+// security_tick: 检测线程慢周期调制(帧); draw_flags/spare: 检测随机源种子混合。
+// 仅在 entangle_or_die() 真正解码成功后返回非零真值。
 uint32_t entangled_security_tick();
+uint32_t entangled_flags();
+uint32_t entangled_spare();
 
 } // namespace t3

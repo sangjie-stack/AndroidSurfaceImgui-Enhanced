@@ -1139,6 +1139,7 @@ T3Result T3Verify::simpleRequest(const std::string& code, const std::string& cod
     if (c != 200) { std::string msg; jsonGetString(decoded, "msg", msg); result.error = msg.empty() ? "未知错误" : msg; return result; }
     std::string msg; jsonGetString(decoded, "msg", msg);
     result.success = true; result.msg = msg;
+    jsonGetString(decoded, "core", result.core);   // 远程总闸字段(可能缺失)
     return result;
 }
 

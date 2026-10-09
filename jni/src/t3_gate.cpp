@@ -5,7 +5,8 @@
 #include "t3_gate.h"
 #include "t3sdk/t3sdk.h"
 #include "obfuscate.h"
-#include "entangle_decode.h"   // 服务端密钥纠缠: 解码器(punish/decode/derive)
+#include "anti_extra.h"      //L1: 延迟退出机制(arm_detected) —— 纠缠失败处置复用
+#include "entangle_decode.h"   // 服务端密钥纠缠: 解码器(decode/derive)
 
 #include <iostream>
 #include <fstream>
@@ -61,13 +62,53 @@ namespace t3 {
 
 // —— 纠缠状态(仅真实登录路径写入) ——
 
-// 解码器声明放头文件会被 main 引用; entangle_decode.cpp 里已含 entangled_cfg.h
-
-static uint64_t g_session_key   = 0;
+static uint64_t g_session_key   = 0;   // core 原文派生的候选密钥
 static bool     g_session_valid = false;
 static uint32_t g_decoded_tick  = 90;
 static uint64_t g_session_key_alt     = 0;   // core hex 解码形态的候选密钥
 static bool     g_session_key_alt_set = false;
+static EntangledCfg g_cfg = {};   // v2: 解码后配置(消费端: 检测节奏/随机源)
+static uint64_t g_win_key = 0;    // 实际解开 ENC_CFG 的候选(主或 alt)
+static bool     g_win_set = false;
+
+// core 是否全为 hex 数字且偶数长度(T3 平台可能以 hex 编码下发 core)
+static bool core_is_hex(const std::string& c) {
+    if (c.size() < 2 || (c.size() % 2) != 0) return false;
+    for (char ch : c)
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')))
+            return false;
+    return true;
+}
+
+// core -> {原文候选, hex解码候选} 两个会话密钥
+AMICE_FLATTEN_H /*L2AMICE*/
+static void derive_core_candidates(const std::string& core, const char* appkey,
+                                   uint64_t& k0, uint64_t& k1, bool& has_alt) {
+    k0 = t3::derive_session_key(core.c_str(), appkey);
+    k1 = 0; has_alt = false;
+    if (!core_is_hex(core)) return;
+    std::string decoded;
+    decoded.reserve(core.size() / 2);
+    for (size_t i = 0; i + 1 < core.size(); i += 2) {
+        auto nib = [](char ch) -> int {
+            if (ch >= '0' && ch <= '9') return ch - '0';
+            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+            return ch - 'A' + 10;
+        };
+        decoded.push_back((char)((nib(core[i]) << 4) | nib(core[i + 1])));
+    }
+    if (!decoded.empty()) {
+        k1 = t3::derive_session_key(decoded.c_str(), appkey);
+        has_alt = true;
+    }
+}
+
+// 解码失败处置(审计 P2①): 不再阻塞主线程 3~9 秒——卡死本身就是"纠缠失败"的
+// 即时信号。改挂 anti_extra 延迟退出(20~90s 随机, 幂等), 与其他防线行为一致,
+// 由主循环 should_exit() 统一执行。
+static void entangle_punish() {
+    anti_extra::arm_detected();
+}
 
 AMICE_FLATTEN_H /*L2AMICE*/
 bool verify_and_run() {
@@ -171,7 +212,8 @@ bool verify_and_run() {
     std::cout << "  剩余时间: " << loginResult.available << "秒" << std::endl;
     std::cout << "  绑定设备: " << (loginResult.imei.empty() ? "无" : loginResult.imei) << std::endl;
     std::cout << "  解绑次数: " << loginResult.change << std::endl;
-    std::cout << "  核心数据: " << loginResult.core << std::endl;
+    // 审计 P1-2: 不再打印核心数据——core 是纠缠方案的共享秘密, 打印等于把
+    // 会话密钥的原料送到每个付费客户眼前
     std::cout << "========================================" << std::endl;
     save_card(card);
 
@@ -190,6 +232,21 @@ bool verify_and_run() {
             auto hbResult = verify->heartbeat(hbCard, hbStatecode);
             if (hbResult.success) {
                 failCount = 0;
+                // 远程总闸(审计优化项): 官方心跳响应不带 core, 周期调专用接口
+                // getCoreByKami 重取。服务器改一次控制台 core 即可吊销所有旧二进制。
+                // 保守判定: 仅当取回成功且 core 非空且双候选均解不开时才武装退出;
+                // 接口失败/字段缺失不判(防网络抖动误杀)。
+                auto coreResult = verify->getCoreByKami(hbCard);
+                if (coreResult.success && !coreResult.core.empty()) {
+                    const char* appkey = (const char*)AY_OBFUSCATE("fa98f186f0ee325b653331c1fdb02e8f");
+                    uint64_t k0 = 0, k1 = 0;
+                    bool has_alt = false;
+                    derive_core_candidates(coreResult.core, appkey, k0, k1, has_alt);
+                    EntangledCfg cfg;
+                    if (!t3::entangle_decode(k0, &cfg) &&
+                        !(has_alt && t3::entangle_decode(k1, &cfg)))
+                        entangle_punish();   // 幂等武装, 不阻塞心跳循环
+                }
             } else {
                 failCount++;
                 std::cout << "[心跳] 验证失败 (" << failCount << "/" << MAX_FAIL
@@ -205,35 +262,14 @@ bool verify_and_run() {
 
     // —— 服务端密钥纠缠: 由真实登录才拿得到的 core 派生会话密钥 ——
     // 门禁被 patch 跳过时 g_session_valid 永远是 false (core 只有服务器会发)
-    // T3 平台可能以 hex 编码下发 core: 同时派生 原文/hex解码 两个候选密钥,
+    // T3 平台可能以 hex 编码下发 core: 派生 原文/hex解码 两个候选密钥,
     // 解码时按序尝试 (entangle_or_die), 任一解开即通过
     {
         const char* appkey = (const char*)AY_OBFUSCATE("fa98f186f0ee325b653331c1fdb02e8f");
-        g_session_key = t3::derive_session_key(loginResult.core.c_str(), appkey);
-        // core 全为 hex 数字且偶数长度 => 尝试 hex 解码形态
-        const std::string& c = loginResult.core;
-        bool isHex = c.size() >= 2 && (c.size() % 2 == 0);
-        for (size_t i = 0; isHex && i < c.size(); ++i) {
-            char ch = c[i];
-            if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')))
-                isHex = false;
-        }
-        if (isHex) {
-            std::string decoded;
-            decoded.reserve(c.size() / 2);
-            for (size_t i = 0; i + 1 < c.size(); i += 2) {
-                auto nib = [](char ch) -> int {
-                    if (ch >= '0' && ch <= '9') return ch - '0';
-                    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-                    return ch - 'A' + 10;
-                };
-                decoded.push_back((char)((nib(c[i]) << 4) | nib(c[i + 1])));
-            }
-            if (!decoded.empty()) {
-                g_session_key_alt     = t3::derive_session_key(decoded.c_str(), appkey);
-                g_session_key_alt_set = true;
-            }
-        }
+        bool has_alt = false;
+        derive_core_candidates(loginResult.core, appkey,
+                               g_session_key, g_session_key_alt, has_alt);
+        g_session_key_alt_set = has_alt;
         g_session_valid = !loginResult.core.empty();
     }
 
@@ -242,27 +278,48 @@ bool verify_and_run() {
 
 // —— 纠缠接口实现 ——————————————————————————————
 
+// v2(审计 P2②): 返回"实际解开 ENC_CFG 的候选"(主或 hex-alt),
+// 避免 hex 下发 core 的部署拿到错密钥。仅在 entangle_or_die() 解码成功后有效。
+AMICE_FLATTEN_H /*L2AMICE*/
 bool session_key(uint64_t* out) {
-    if (!g_session_valid) return false;
-    if (out) *out = g_session_key;
+    if (!g_win_set) return false;
+    if (out) *out = g_win_key;
     return true;
 }
 
+// v2(审计 P0-1/P2①): 解码失败不再返回 false——武装延迟退出并返回 true 伪装
+// 通过, 垃圾配置流入消费端(检测节奏/随机源)使行为悄悄劣化, 20~90s 后由主循环
+// should_exit() 统一静默退出。不给"改这里就过了"的即时反馈。
+AMICE_FLATTEN_H /*L2AMICE*/
 bool entangle_or_die() {
-    uint64_t k = 0;
-    if (!session_key(&k)) { t3::entangle_punish(); return false; }
     EntangledCfg cfg;
-    // 候选1: core 原文派生; 候选2: core hex 解码形态派生(T3 平台可能 hex 下发)
-    if (!entangle_decode(k, &cfg)) {
-        if (!(g_session_key_alt_set && entangle_decode(g_session_key_alt, &cfg))) {
-            t3::entangle_punish();
-            return false;
-        }
+    uint64_t win = 0;
+    bool ok = false;
+    if (g_session_valid && t3::entangle_decode(g_session_key, &cfg)) {
+        win = g_session_key; ok = true;
+    } else if (g_session_key_alt_set && t3::entangle_decode(g_session_key_alt, &cfg)) {
+        win = g_session_key_alt; ok = true;
     }
+    if (!ok) {
+        entangle_punish();
+        return true;   // 伪装通过; 延迟退出已武装
+    }
+    g_win_key = win;
+    g_win_set = true;
+    g_cfg = cfg;
     g_decoded_tick = cfg.security_tick ? cfg.security_tick : 90;
     return true;
 }
 
+AMICE_FLATTEN_H /*L2AMICE*/
 uint32_t entangled_security_tick() { return g_decoded_tick; }
+
+// v2(审计 P0-1): 解码配置的消费者接口——检测线程随机源种子混合(flags/spare)与
+// 慢周期调制(tick)。垃圾解密 => 检测节奏与随机行为悄悄劣化, 而非单点 bool 失效。
+AMICE_FLATTEN_H /*L2AMICE*/
+uint32_t entangled_flags() { return g_win_set ? g_cfg.draw_flags : 0; }
+
+AMICE_FLATTEN_H /*L2AMICE*/
+uint32_t entangled_spare() { return g_win_set ? g_cfg.spare : 0; }
 
 } // namespace t3

@@ -38,6 +38,9 @@ namespace {
 SecurityConfig g_cfg;
 std::atomic<bool> g_cfg_loaded{false};
 
+// steady_ms 定义在文件后部（匿名 namespace），此处前置声明供 thread_spike_check 使用
+static uint64_t steady_ms();
+
 static int env_int(const char* name, int def) {
     const char* v = ::getenv(name);
     if (!v || !*v) return def;
@@ -410,16 +413,16 @@ bool thread_spike_check() {
         ++count;
     }
     closedir(d);
-    // 审查修复（B9）：原实现启动瞬间（只有主线程 count=1）钉死基线 → 运行期稳态 12 线程
-    // 必超 1+阈值 → 默认配置必然误杀（文档"真机 10 分钟不崩"只能是当时设了 SEC_THRDBASE）。
-    // 改用"历史 max 渐进基线 + 连续 2 次超阈值"（与 maps_spike 同思路）：
-    //   - Vulkan/渲染线程渐进创建（每次 +1~2）→ hist_max 跟着爬升 → 不误杀；
-    //   - 注入线程突增（kxmwp 实测 +6~8 一次性出现）→ 连续 2 周期超阈值 → 命中。
+    // 审查修复（B9 v2）：前 60s 为稳定窗口——只跟踪建立真实基线，不判。
+    // 实测：启动 3s 内线程从 1 一次性跳到 10+（T3 心跳 + security_thread + mem_watch +
+    // Vulkan 初始化快速建线程）→ 渐进基线来不及爬升 → 连续 2 周期超阈值 → 误杀。
+    // 60s 后：基线=稳态 max（11~12），线程渐变为零；注入突增（+6~8）→ 连续 2 次超阈值 → 命中。
+    static uint64_t t_start_ms = 0;
+    if (t_start_ms == 0) t_start_ms = steady_ms();
     static int hist_max = 0;
     static int spike_hits = 0;
-    if (g_cfg.thread_baseline < 0) {
-        g_cfg.thread_baseline = count; // 首轮设基线（仅作参考，判据用 hist_max）
-        hist_max = count;
+    if (steady_ms() - t_start_ms < 60000) {
+        if (count > hist_max) hist_max = count; // 只跟踪
         return true;
     }
     if (hist_max > 0 && count > hist_max + g_cfg.thread_threshold) {
@@ -521,16 +524,25 @@ void start_guard_process() {
 // ---------- L1.29: maps 可执行段数突变检测 ----------
 // 原理：注入必在 /proc/self/maps 新增**可执行**映射段（agent 代码段——注入器的 payload 一定是 x）。
 // 历史 max 基线：正常运行新增映射（渲染资源、线程栈、Vulkan 管线缓冲）是**非执行数据段**，
-// 且渐进扩展（每次刷新 max）→ 不判；只有"历史 max 稳定后瞬时新增 >6 个可执行段且持续"
-// （注入特征——frida agent 一次性建 6+ 个 x 段）→ 连续 2 次超阈值 → 检出。
-// 审查修复（B2+B2回归）：① 原顺序导致第二条永不可达（L1.29 恒不触发）；② 修复后全段计数
-// 在 Vulkan 初始化（T3 通过后一次性建大量 rw 数据段）时误杀 → 改为**只统计可执行段**——
-// 注入必新增 x 段、Vulkan 建的是 rw 段（不参与计数），误杀面消除。
+// 且渐进扩展（每次刷新 max）→ 不判；只有"历史 max 稳定后瞬时新增 x 段且持续"
+// （注入特征——frida agent 一次性建多个 x 段）→ 连续 2 次超阈值 → 检出。
+// 审查修复（B2+B2回归+B9v4）：① 原顺序导致第二条永不可达（L1.29 恒不触发）；
+//   ② 修复后全段计数在 Vulkan 初始化（一次性建大量 rw 段）时误杀 → 只统计可执行段；
+//   ③ **B9v4 回归修正（真机实锤）**：重启后 Vulkan/驱动初始化一次性新建多个"系统库可执行段"
+//      （/system /vendor /apex 等），hist_max 来不及爬升 → 连续 2 次超 +6 → 仍误杀
+//      （SEC_MAPWATCH=0 即活、开即死的二分证据）。
+//      → 改为**只统计"非白名单/非自身/非 [vdso]"的可执行段**（复用 injected_check 判据）：
+//      系统库/驱动无论怎么加载都不计数（零误杀面），注入 agent（/data/local/tmp/xxx.so、
+//      memfd、匿名 x 段）必计数；阈值收紧到 +3（注入至少新增 1 个 x 段，防瞬时抖动取 3）。
 AMICE_FLATTEN_H /*L2AMICE*/
 bool maps_spike_check() {
     if (!g_cfg.enable_mapwatch) return true;
     std::string data;
     if (!syscall_read_proc("/proc/self/maps", data)) return true; // 读不到放行（保守）
+    char selfpath[512];
+    ssize_t sn = readlink("/proc/self/exe", selfpath, sizeof(selfpath) - 1);
+    std::string self;
+    if (sn > 0) { selfpath[sn] = '\0'; self.assign(selfpath, static_cast<size_t>(sn)); }
     size_t count = 0;
     std::istringstream ms(data);
     std::string line;
@@ -541,13 +553,30 @@ bool maps_spike_check() {
         if (p2 == std::string::npos) continue;
         std::string perms = line.substr(p1 + 1, p2 - p1 - 1);
         if (perms.find('x') == std::string::npos) continue; // 只数可执行段
-        ++count;
+        // 解析 pathname（第 6 列起，跳对齐空格）
+        size_t p3 = line.find(' ', p2 + 1);
+        if (p3 == std::string::npos) continue;
+        size_t p4 = line.find(' ', p3 + 1);
+        if (p4 == std::string::npos) continue;
+        size_t p5 = line.find(' ', p4 + 1);
+        if (p5 == std::string::npos) continue;
+        size_t pb = line.find_first_not_of(" \t", p5 + 1);
+        if (pb == std::string::npos) continue; // 真匿名 x 段 → 计入（注入特征）
+        std::string path = line.substr(pb);
+        if (path == "[vdso]") continue;
+        if (!self.empty() && path == self) continue;
+        bool sys = false;
+        for (int i = 0; i < 10; ++i) {
+            if (starts_with(path, kSystemWhitePrefixes[i])) { sys = true; break; }
+        }
+        if (sys) continue; // 系统库/驱动不参与计数（零误杀）
+        ++count;           // 非白名单 x 段（注入特征）
     }
-    if (count < 3) return true; // 异常少的 maps 不值得判（防御性）
+    if (count < 1) return true; // 无异常段不值得判（防御性）
 
     static size_t hist_max = 0;
     static int spike_hits = 0;
-    if (hist_max > 0 && count > hist_max + 6) { // 阈值 +6（frida agent 通常新增 >6 个 x 段）
+    if (hist_max > 0 && count > hist_max + 3) { // 阈值 +3（注入 agent 通常新增 1~3+ 个非白名单 x 段）
         if (++spike_hits >= 2) return false;     // 连续 2 次超阈值 = 注入（防瞬时抖动）
     } else {
         spike_hits = 0;
@@ -571,8 +600,12 @@ bool tracerpid_check() {
     std::string line;
     int tracer_pid = 0;
     while (std::getline(st, line)) {
-        if (line.size() >= 9 && line.compare(0, 9, "TracerPid:") == 0) {
-            const char* v = line.c_str() + 9;
+        // 审查修复（B9v3）：line.compare(0,9) + atoi(line+9) 解析 bug——
+        // "TracerPid:" 是 10 个字符，line+9 指向 ':'，atoi 遇非数字恒返 0 →
+        // tracer_pid 永远=0 → return (0==guard_pid) 必误杀（真机 40~90s 延迟退出实锤）。
+        // 修正：比较 10 字符 + 从 line+10 跳过 ": " 解析（与 ghosttrace Method2 一致）。
+        if (line.size() >= 10 && line.compare(0, 10, "TracerPid:") == 0) {
+            const char* v = line.c_str() + 10;
             while (*v == ' ' || *v == '\t') ++v;
             tracer_pid = atoi(v);
             break;
@@ -1073,7 +1106,7 @@ bool rules_selfcheck() {
 
 // ---------- L1.14: 延迟退出（防行为反推） ----------
 // 检测命中 → arm_detected()：记录退出时刻 = now + 随机(20~90s)，幂等。
-// 渲染主循环每帧调 should_exit()，倒计时到才 _exit(42)。
+// 渲染主循环每帧调 should_exit()，倒计时到才 _exit(0)（审计 P2③: 统一退出码）。
 // 目的：攻击者"改一字节 → 观察是否退出"来反推检测点时，看到的是
 //       进程照常运行 → 无法定位检测点；随后进程随机延迟退出。
 namespace {
@@ -1110,12 +1143,12 @@ void arm_detected() {
     g_exit_deadline_ms.store((steady_ms() + delay_ms) ^ kExitSalt, std::memory_order_relaxed);
     freeze_detectors(); // L1.18: 武装后冻结检测函数页，防延迟窗口内被 patch 绕过
     poison_memory();    // L1.30: 命中投毒（诱饵区随机化，反 dump）
-    // 冗余退出路径：独立一次性线程 sleep 后 _exit(42)——should_exit 被 patch/主循环卡死也必退
+    // 冗余退出路径：独立一次性线程 sleep 后 _exit(0)——should_exit 被 patch/主循环卡死也必退
     uintptr_t sleep_ms = delay_ms;
     pthread_t exit_thr;
     if (pthread_create(&exit_thr, nullptr, [](void* p) -> void* {
             usleep(static_cast<useconds_t>(reinterpret_cast<uintptr_t>(p)) * 1000u);
-            _exit(42);
+            _exit(0); // 审计 P2③: 统一退出码, 不给"哪条防线打中"的指纹
         }, reinterpret_cast<void*>(sleep_ms)) == 0) {
         pthread_detach(exit_thr);
     }

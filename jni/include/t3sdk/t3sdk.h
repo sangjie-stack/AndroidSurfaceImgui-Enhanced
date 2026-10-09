@@ -19,6 +19,7 @@ struct T3Result {
     bool success = false;
     std::string error;
     std::string msg;
+    std::string core;   // 远程总闸: 心跳响应携带 core 时用于吊销判定(缺失则不判)
 };
 
 struct T3LoginResult {
