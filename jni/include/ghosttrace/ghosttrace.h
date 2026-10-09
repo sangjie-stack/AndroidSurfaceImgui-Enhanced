@@ -693,11 +693,14 @@ GT_API int gt_is_stealth_mode(void);
 GT_API void gt_stealth_deobfuscate_string(const unsigned char *input, size_t length, char *output);
 
 /* Macros for stealth strings */
+/* 审查修复（B7）：原宏展开为 static char name[len+1] —— 解混淆后的明文常驻 .bss，
+   内存 dump 直接可见。改为**栈上局部数组 + char* 别名**：函数返回即失效（即用即毁），
+   明文不再跨调用常驻。调用点用法不变（name 从 static 数组变为 char* 指针，只读
+   参数语义完全兼容）。len 均为编译期字面量 → 普通数组，非 VLA。 */
 #define GT_STEALTH_STRING(name, data, len) \
-    static char name[len + 1]; \
-    do { \
-        gt_stealth_deobfuscate_string((const unsigned char*)data, len, name); \
-    } while(0)
+    char _gt_sbuf_##name[len + 1]; \
+    gt_stealth_deobfuscate_string((const unsigned char*)data, len, _gt_sbuf_##name); \
+    char *name = _gt_sbuf_##name
 
 /* Callback Functions */
 
