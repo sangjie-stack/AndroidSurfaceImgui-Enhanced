@@ -5,6 +5,7 @@
 #include "t3_gate.h"
 #include "t3sdk/t3sdk.h"
 #include "obfuscate.h"
+#include "entangle_decode.h"   // 服务端密钥纠缠: 解码器(punish/decode/derive)
 
 #include <iostream>
 #include <fstream>
@@ -57,6 +58,14 @@ static std::string trim_card(std::string card) {
 }
 
 namespace t3 {
+
+// —— 纠缠状态(仅真实登录路径写入) ——
+
+// 解码器声明放头文件会被 main 引用; entangle_decode.cpp 里已含 entangled_cfg.h
+
+static uint64_t g_session_key   = 0;
+static bool     g_session_valid = false;
+static uint32_t g_decoded_tick  = 90;
 
 AMICE_FLATTEN_H /*L2AMICE*/
 bool verify_and_run() {
@@ -192,7 +201,33 @@ bool verify_and_run() {
     });
     heartbeatThread.detach();
 
+    // —— 服务端密钥纠缠: 由真实登录才拿得到的 core 派生会话密钥 ——
+    // 门禁被 patch 跳过时 g_session_valid 永远是 false (core 只有服务器会发)
+    g_session_key   = t3::derive_session_key(loginResult.core.c_str(),
+                                             (const char*)AY_OBFUSCATE("fa98f186f0ee325b653331c1fdb02e8f"));
+    g_session_valid = !loginResult.core.empty();
+
     return true;
 }
+
+// —— 纠缠接口实现 ——————————————————————————————
+static const uint64_t kZeroKey = 0;
+
+bool session_key(uint64_t* out) {
+    if (!g_session_valid) return false;
+    if (out) *out = g_session_key;
+    return true;
+}
+
+bool entangle_or_die() {
+    uint64_t k = 0;
+    if (!session_key(&k)) { t3::entangle_punish(); return false; }
+    EntangledCfg cfg;
+    if (!entangle_decode(k, &cfg)) { t3::entangle_punish(); return false; }
+    g_decoded_tick = cfg.security_tick ? cfg.security_tick : 90;
+    return true;
+}
+
+uint32_t entangled_security_tick() { return g_decoded_tick; }
 
 } // namespace t3

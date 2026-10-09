@@ -139,6 +139,11 @@ int main(int argc, char *argv[]) {
     if (!t3::verify_and_run())
         return 0;
 
+    // 服务端密钥纠缠: 门禁通过后必须用服务器下发的 core 解密业务配置。
+    // patch 掉上面的门禁(或控制台未配 core) => 这里解出垃圾 => 延迟静默退出
+    if (!t3::entangle_or_die())
+        return 0;
+
     ::graphics = GraphicsManager::getGraphicsInterface(GraphicsManager::VULKAN);
 
     //获取屏幕信息    
