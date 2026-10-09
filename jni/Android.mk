@@ -38,12 +38,14 @@ LOCAL_CFLAGS := -std=c17
 LOCAL_CFLAGS += -fvisibility=hidden
 LOCAL_CFLAGS += -O3 -ffunction-sections -fdata-sections -fno-ident #L0加固: 优化/裁剪/去编译器标识
 LOCAL_CFLAGS += -fstack-protector-strong #L0加固: 栈溢出保护
+LOCAL_CFLAGS += -mbranch-protection=standard #L0加固: arm64 BTI/PAC 防 ROP/跳转注入
 LOCAL_CFLAGS += -DPLATFORM_ANDROID=1 -DARCH_ARM64=1 #GhostTrace平台选择
 
 LOCAL_CPPFLAGS := -std=c++17
 LOCAL_CPPFLAGS += -fvisibility=hidden
 LOCAL_CPPFLAGS += -O3 -ffunction-sections -fdata-sections -fno-ident #L0加固: 优化/裁剪/去编译器标识
 LOCAL_CPPFLAGS += -fstack-protector-strong #L0加固: 栈溢出保护
+LOCAL_CPPFLAGS += -mbranch-protection=standard #L0加固: arm64 BTI/PAC
 LOCAL_CPPFLAGS += -DPLATFORM_ANDROID=1 -DARCH_ARM64=1 #GhostTrace平台选择
 
 LOCAL_CPPFLAGS += -DVK_USE_PLATFORM_ANDROID_KHR

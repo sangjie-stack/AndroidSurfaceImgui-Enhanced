@@ -70,14 +70,40 @@ static bool     g_session_key_alt_set = false;
 static EntangledCfg g_cfg = {};   // v2: 解码后配置(消费端: 检测节奏/随机源)
 static uint64_t g_win_key = 0;    // 实际解开 ENC_CFG 的候选(主或 alt)
 static bool     g_win_set = false;
+// v2.5: 业务特征常量(--blob 生成时启用); 静态缓冲, 仅解码成功路径填充
+static uint8_t  g_features_buf[ENC_FEATURES_LEN > 0 ? ENC_FEATURES_LEN : 1] = {};
+static uint32_t g_features_len = 0;
 
 // core 是否全为 hex 数字且偶数长度(T3 平台可能以 hex 编码下发 core)
+// VMP 注解: 纯标量小循环, 符合 VMP 画像
+AMICE_VMP /*L2AMICE*/
 static bool core_is_hex(const std::string& c) {
     if (c.size() < 2 || (c.size() % 2) != 0) return false;
     for (char ch : c)
         if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')))
             return false;
     return true;
+}
+
+// hex 解码(纯标量, VMP 画像); 返回解码字节数, 非法字符截断
+AMICE_VMP /*L2AMICE*/
+static size_t hex_decode_raw(const char* src, size_t n, uint8_t* dst) {
+    size_t m = 0;
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        int hi, lo;
+        char ch = src[i];
+        if (ch >= '0' && ch <= '9') hi = ch - '0';
+        else if (ch >= 'a' && ch <= 'f') hi = ch - 'a' + 10;
+        else if (ch >= 'A' && ch <= 'F') hi = ch - 'A' + 10;
+        else break;
+        ch = src[i + 1];
+        if (ch >= '0' && ch <= '9') lo = ch - '0';
+        else if (ch >= 'a' && ch <= 'f') lo = ch - 'a' + 10;
+        else if (ch >= 'A' && ch <= 'F') lo = ch - 'A' + 10;
+        else break;
+        dst[m++] = (uint8_t)((hi << 4) | lo);
+    }
+    return m;
 }
 
 // core -> {原文候选, hex解码候选} 两个会话密钥
@@ -87,17 +113,10 @@ static void derive_core_candidates(const std::string& core, const char* appkey,
     k0 = t3::derive_session_key(core.c_str(), appkey);
     k1 = 0; has_alt = false;
     if (!core_is_hex(core)) return;
-    std::string decoded;
-    decoded.reserve(core.size() / 2);
-    for (size_t i = 0; i + 1 < core.size(); i += 2) {
-        auto nib = [](char ch) -> int {
-            if (ch >= '0' && ch <= '9') return ch - '0';
-            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-            return ch - 'A' + 10;
-        };
-        decoded.push_back((char)((nib(core[i]) << 4) | nib(core[i + 1])));
-    }
-    if (!decoded.empty()) {
+    std::string decoded(core.size() / 2, '\0');
+    size_t m = hex_decode_raw(core.data(), core.size(), (uint8_t*)&decoded[0]);
+    if (m > 0) {
+        decoded.resize(m);
         k1 = t3::derive_session_key(decoded.c_str(), appkey);
         has_alt = true;
     }
@@ -120,18 +139,27 @@ bool verify_and_run() {
     std::cout << "========================================" << std::endl << std::endl;
 
     // RSA模式初始化: 调用码/APPKEY/公钥全部编译期加密, 二进制无明文
-    if (!verify->initRSA(
-        (const char*)AY_OBFUSCATE("76478CC2AC33CB6A"),                          /* 单码登录调用码 */
-        (const char*)AY_OBFUSCATE("D13B45357DEAFAB3"),                          /* 获取程序公告调用码 */
-        (const char*)AY_OBFUSCATE("3B403E6EC9CA0973"),                          /* 获取程序最新版本号调用码 */
-        (const char*)AY_OBFUSCATE("7B117AAE9116EFDA"),                          /* 单码卡密心跳验证调用码 */
-        (const char*)AY_OBFUSCATE("fa98f186f0ee325b653331c1fdb02e8f"),          /* 程序密钥APPKEY */
-        (const char*)AY_OBFUSCATE("-----BEGIN PUBLIC KEY-----\n"
+    // 审计次要项: 绑 auto 拷贝加密副本(静态原件永不解密), 副本明文窗口仅限
+    // 本次调用, 域尾析构自动清零——旧写法直接转换静态对象, 解密后明文常驻
+    // .bss 直到进程退出, 内存 dump 一次全拿
+    auto codeSingleLogin = AY_OBFUSCATE("76478CC2AC33CB6A");                          /* 单码登录调用码 */
+    auto codeNotice      = AY_OBFUSCATE("D13B45357DEAFAB3");                          /* 获取程序公告调用码 */
+    auto codeVersion     = AY_OBFUSCATE("3B403E6EC9CA0973");                          /* 获取程序最新版本号调用码 */
+    auto codeHeartbeat   = AY_OBFUSCATE("7B117AAE9116EFDA");                          /* 单码卡密心跳验证调用码 */
+    auto appkeyInit      = AY_OBFUSCATE("fa98f186f0ee325b653331c1fdb02e8f");          /* 程序密钥APPKEY */
+    auto rsaPubkey       = AY_OBFUSCATE("-----BEGIN PUBLIC KEY-----\n"
                      "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC+MFUZNtLLLOeHvacXHuoxiqcg\n"
                      "CusS7lVs5AbnBYXYcANbFQy9nNMGb+RJsf+eprWvQlK08+fCP/v78s0w7r3cFRPR\n"
                      "4uVbvWoQPe6pke7SSZQaZPLZWLpglpi0zcw0KMFzA4LitKtep4NhEkTCMFv/wxSF\n"
                      "QyYlwmJKh+4MgRRmcwIDAQAB\n"
-                     "-----END PUBLIC KEY-----")                    /* RSA公钥 */
+                     "-----END PUBLIC KEY-----");                                       /* RSA公钥 */
+    if (!verify->initRSA(
+        (const char*)codeSingleLogin,
+        (const char*)codeNotice,
+        (const char*)codeVersion,
+        (const char*)codeHeartbeat,
+        (const char*)appkeyInit,
+        (const char*)rsaPubkey
     )) {
         std::cout << "SDK初始化失败!" << std::endl;
         return false;
@@ -238,10 +266,10 @@ bool verify_and_run() {
                 // 接口失败/字段缺失不判(防网络抖动误杀)。
                 auto coreResult = verify->getCoreByKami(hbCard);
                 if (coreResult.success && !coreResult.core.empty()) {
-                    const char* appkey = (const char*)AY_OBFUSCATE("fa98f186f0ee325b653331c1fdb02e8f");
+                    auto appkey = AY_OBFUSCATE("fa98f186f0ee325b653331c1fdb02e8f"); // auto 保活, 域尾清零
                     uint64_t k0 = 0, k1 = 0;
                     bool has_alt = false;
-                    derive_core_candidates(coreResult.core, appkey, k0, k1, has_alt);
+                    derive_core_candidates(coreResult.core, (const char*)appkey, k0, k1, has_alt);
                     EntangledCfg cfg;
                     if (!t3::entangle_decode(k0, &cfg) &&
                         !(has_alt && t3::entangle_decode(k1, &cfg)))
@@ -265,9 +293,12 @@ bool verify_and_run() {
     // T3 平台可能以 hex 编码下发 core: 派生 原文/hex解码 两个候选密钥,
     // 解码时按序尝试 (entangle_or_die), 任一解开即通过
     {
-        const char* appkey = (const char*)AY_OBFUSCATE("fa98f186f0ee325b653331c1fdb02e8f");
+        // 审计次要项: 绑 auto 保活 obfuscated_data(析构自动清零)——旧写法
+        // `const char* = (const char*)AY_OBFUSCATE(...)` 绑的是已析构临时,
+        // 悬垂 UB(碰巧踩残留栈字节"能用"); 明文窗口也因此在使用中就被清零
+        auto appkey = AY_OBFUSCATE("fa98f186f0ee325b653331c1fdb02e8f");
         bool has_alt = false;
-        derive_core_candidates(loginResult.core, appkey,
+        derive_core_candidates(loginResult.core, (const char*)appkey,
                                g_session_key, g_session_key_alt, has_alt);
         g_session_key_alt_set = has_alt;
         g_session_valid = !loginResult.core.empty();
@@ -308,11 +339,24 @@ bool entangle_or_die() {
     g_win_set = true;
     g_cfg = cfg;
     g_decoded_tick = cfg.security_tick ? cfg.security_tick : 90;
+    // v2.5: 同一条密钥流接续解密业务特征常量(未用 --blob 时为空, 静默跳过)
+    g_features_len = 0;
+    if (ENC_FEATURES_LEN > 0 &&
+        t3::entangle_decode_features(win, g_features_buf, ENC_FEATURES_LEN))
+        g_features_len = ENC_FEATURES_LEN;
     return true;
 }
 
 AMICE_FLATTEN_H /*L2AMICE*/
 uint32_t entangled_security_tick() { return g_decoded_tick; }
+
+// v2.5(预留): 解密后的业务特征常量(偏移/参数)。仅 entangle_or_die() 用真实
+// core 解码成功后有效; patch 门禁 => 垃圾偏移 => 功能静默失效(数据依赖)
+AMICE_FLATTEN_H /*L2AMICE*/
+const uint8_t* entangled_features(uint32_t* len) {
+    if (len) *len = g_features_len;
+    return g_features_len ? g_features_buf : nullptr;
+}
 
 // v2(审计 P0-1): 解码配置的消费者接口——检测线程随机源种子混合(flags/spare)与
 // 慢周期调制(tick)。垃圾解密 => 检测节奏与随机行为悄悄劣化, 而非单点 bool 失效。

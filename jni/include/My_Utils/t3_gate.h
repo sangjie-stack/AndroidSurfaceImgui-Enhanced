@@ -28,4 +28,9 @@ uint32_t entangled_security_tick();
 uint32_t entangled_flags();
 uint32_t entangled_spare();
 
+// v2.5(预留): 解密后的业务特征常量(gen_entangle.py --blob 生成时启用)。
+// 与主配置同一条会话密钥流; patch 门禁 => 垃圾偏移 => 功能静默失效。
+// 未启用 --blob 时返回 nullptr / *len=0。
+const uint8_t* entangled_features(uint32_t* len);
+
 } // namespace t3

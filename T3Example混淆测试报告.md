@@ -97,3 +97,18 @@ VmFlatten(login/encodeParams/encrypt/heartbeat)
 - 日志：`~/amice-lab/results-t3/{A_base,B_str,C_full_exc,D_full_noexc,E_vmflat,F_vmp_O1,G_vmflat_exc}.log`
 - 产物：`~/amice-lab/dist/t3_cli.{A_base,B_str,D_full_noexc}.bin`
 - 探针：`~/amice-lab/vmp_probe2.cpp`（寄存器预算/指针物化边界）
+
+## 6. 在线链路真机回归（2026-10-09 补测，网络恢复后）
+
+设备 a78ccd03（root），喂 `.t3card` 自动登录，四档全部实测：
+
+| 档 | 版本检查 | 登录 | 心跳 |
+|---|---|---|---|
+| A_base（无混淆） | ✅ 最新版 | ✅ 登录成功 | ✅ 已启动 |
+| B_str（字符串加密） | ✅ | ✅ | ✅ |
+| D_full_noexc（fla+bcf+ib） | ✅ | ✅ | ✅ |
+| E5_vmf（VmFlatten×5 函数） | ✅ | ✅ | ✅ |
+
+- 此前的"连接失败"确认为服务器/网络抖动（同网络 A 基线亦间歇失败，背靠背重测全部通过）
+- E5 补测 130s 浸泡：跨两个心跳周期，`[心跳] 验证成功`×2、零失败（设备 USB 断连恢复后补完）
+- **结论：四档混淆在真实服务器验证链上功能等价，T3Example 试验田全部闭环**

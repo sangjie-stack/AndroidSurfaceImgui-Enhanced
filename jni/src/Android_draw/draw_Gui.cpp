@@ -1,4 +1,5 @@
 #include "draw.h"
+#include "amice_annotate.h" //L2: amice 混淆注解
 #include "obfuscate.h" //L1: 编译期字符串加密 (adamyaxley/Obfuscate, Unlicense)
 
 #include "My_font/zh_Font.h"
@@ -68,6 +69,9 @@ void screen_config() {
     ::displayInfo = android::ANativeWindowCreator::GetDisplayInfo();
 }
 
+// L2(次要项): 每帧热路径——帧预备与窗口/渲染重建入口, 升 dominator 级 Flatten
+// (全局环境变量只覆盖 basic 级)
+AMICE_FLATTEN_H /*L2AMICE*/
 void drawBegin() {
     if (::permeate_record_ini) {
         LastCoordinate.Pos_x = ::g_window->Pos.x;
@@ -97,6 +101,8 @@ void drawBegin() {
 }
 
 
+// L2(次要项): 每帧菜单/业务渲染主体——攻击者 patch 菜单逻辑/绘制开关的首选目标
+AMICE_FLATTEN_H /*L2AMICE*/
 void Layout_tick_UI(bool *main_thread_flag) {
     static bool show_draw_Line = false;
     static bool show_demo_window = false;
@@ -106,14 +112,15 @@ void Layout_tick_UI(bool *main_thread_flag) {
         static int counter = 0;
         static int style_idx = 0;
         static ImVec4 clear_color = ImVec4(0.0f, 0.0f, 0.0f, 1.0f);
-        ImGui::Begin("AndroidSurfaceImguiEnhanced", main_thread_flag);  // Create a window called "Hello, world!" and append into it.
+        // L1: 菜单窗口标题与仓库名同串, 是二进制明文指纹——加密(同原生窗口名)
+        ImGui::Begin(AY_OBFUSCATE("AndroidSurfaceImguiEnhanced"), main_thread_flag);  // Create a window called "Hello, world!" and append into it.
         if (::permeate_record_ini) {
             ImGui::SetWindowPos({LastCoordinate.Pos_x, LastCoordinate.Pos_y});
             ImGui::SetWindowSize({LastCoordinate.Size_x, LastCoordinate.Size_y});
             permeate_record_ini = false;   
         }
-        ImGui::Text("渲染接口 : %s, gui版本 : %s", graphics->RenderName, ImGui::GetVersion());               // Display some text (you can use a format strings too)
-		if (ImGui::Combo("##主题", &style_idx, "白色主题\0蓝色主题\0紫色主题\0")) {
+        ImGui::Text((const char*)AY_OBFUSCATE("渲染接口 : %s, gui版本 : %s"), graphics->RenderName, ImGui::GetVersion());               // Display some text (you can use a format strings too)
+		if (ImGui::Combo((const char*)AY_OBFUSCATE("##主题"), &style_idx, (const char*)AY_OBFUSCATE("白色主题\0蓝色主题\0紫色主题\0"))) {
 			switch (style_idx) {
 				case 0: ImGui::StyleColorsLight(); break;
 				case 1: ImGui::StyleColorsDark(); break;
@@ -121,34 +128,34 @@ void Layout_tick_UI(bool *main_thread_flag) {
 			}
 		}
 		
-        if (ImGui::Checkbox("过录制", &::permeate_record)) {
+        if (ImGui::Checkbox((const char*)AY_OBFUSCATE("过录制"), &::permeate_record)) {
             ::permeate_record_ini = true;
         }
             
-        ImGui::Checkbox("演示窗口", &show_demo_window);      // Edit bools storing our window open/close state
+        ImGui::Checkbox((const char*)AY_OBFUSCATE("演示窗口"), &show_demo_window);      // Edit bools storing our window open/close state
         ImGui::SameLine();
-        ImGui::Checkbox("绘制射线", &show_draw_Line);
-        ImGui::Checkbox("坤坤窗口", &show_another_window);
-        ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
-        ImGui::ColorEdit4("取色器", (float *) &clear_color); // Edit 3 floats representing a color
-        if (ImGui::Button("Button")) {
+        ImGui::Checkbox((const char*)AY_OBFUSCATE("绘制射线"), &show_draw_Line);
+        ImGui::Checkbox((const char*)AY_OBFUSCATE("坤坤窗口"), &show_another_window);
+        ImGui::SliderFloat((const char*)AY_OBFUSCATE("float"), &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
+        ImGui::ColorEdit4((const char*)AY_OBFUSCATE("取色器"), (float *) &clear_color); // Edit 3 floats representing a color
+        if (ImGui::Button((const char*)AY_OBFUSCATE("Button"))) {
             counter++;
         }
         
         ImGui::SameLine();
-        ImGui::Text("计数 = %d", counter);
-        ImGui::Text("窗口集中 = %d", ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow));
-        ImGui::TextColored(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), "应用平均 %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
+        ImGui::Text((const char*)AY_OBFUSCATE("计数 = %d"), counter);
+        ImGui::Text((const char*)AY_OBFUSCATE("窗口集中 = %d"), ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow));
+        ImGui::TextColored(ImVec4(1.0f, 0.0f, 1.0f, 1.0f), (const char*)AY_OBFUSCATE("应用平均 %.3f ms/frame (%.1f FPS)"), 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
         g_window = ImGui::GetCurrentWindow();
         ImGui::End();
     }
     
         
     if (show_another_window) { // 3. Show another simple window.
-        ImGui::Begin("另一个窗口", &show_another_window);   // Pass a pointer to our bool variable (the window will have a closing button that will clear the bool when clicked)
-        ImGui::Text("另一个窗口的 爱坤!");
+        ImGui::Begin((const char*)AY_OBFUSCATE("另一个窗口"), &show_another_window);   // Pass a pointer to our bool variable (the window will have a closing button that will clear the bool when clicked)
+        ImGui::Text((const char*)AY_OBFUSCATE("另一个窗口的 爱坤!"));
         ImGui::Image(Aekun_image.DS, ImVec2(170, 170));
-        if (ImGui::Button("关闭这个坤口")) {
+        if (ImGui::Button((const char*)AY_OBFUSCATE("关闭这个坤口"))) {
             show_another_window = false;
         }
         ImGui::End();

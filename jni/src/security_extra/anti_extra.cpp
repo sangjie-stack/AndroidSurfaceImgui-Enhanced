@@ -65,6 +65,13 @@ SecurityConfig& sec_cfg() { return g_cfg; }
 
 void load_sec_cfg_from_env() {
     if (g_cfg_loaded.load(std::memory_order_relaxed)) return;
+#ifndef SEC_ALLOW_ENV_CFG
+    // 审计修复(2026-10-09): getenv 由进程启动者控制——SEC_*=0 曾可静默全部检测。
+    // 生产构建一律忽略环境变量, 全部检测保持 SecurityConfig 默认开启;
+    // 调试构建加 -DSEC_ALLOW_ENV_CFG=1 恢复运行时调参。
+    g_cfg_loaded.store(true, std::memory_order_relaxed);
+    return;
+#else
     g_cfg.enable_injected   = env_bool("SEC_INJ", true);
     g_cfg.enable_memfd      = env_bool("SEC_MEMFD", true);
     g_cfg.enable_thread     = env_bool("SEC_THREAD", true);
@@ -88,6 +95,7 @@ void load_sec_cfg_from_env() {
     lo = g_cfg.slow_interval_min; hi = g_cfg.slow_interval_max;
     if (parse_range(::getenv("SEC_SLOW_INTV"), lo, hi)) { g_cfg.slow_interval_min = lo; g_cfg.slow_interval_max = hi; }
     g_cfg_loaded.store(true, std::memory_order_relaxed);
+#endif
 }
 
 // ---------- L1.8: 禁止内存 dump（非 root 进程读 /proc/pid/mem 失效） ----------

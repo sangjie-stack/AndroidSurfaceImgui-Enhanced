@@ -85,22 +85,26 @@ static void* security_thread_fn(void*) {
     const anti_extra::SecurityConfig& c = anti_extra::sec_cfg();
     uint64_t next_slow = 0; // 首轮快检测后立即跑一次慢检测
     for (;;) {
+        // 审计 P0-1: 纠缠解密值消费——draw_flags/spare 混入检测随机源种子,
+        // 垃圾解密 => 检测节奏与随机行为悄悄劣化(而非单点 bool 失效)
+        g_tick_xs ^= t3::entangled_flags() ^ t3::entangled_spare();
         useconds_t wait_us = static_cast<useconds_t>(c.fast_interval_min) * 1000000u +
             (tick_xorshift() % (static_cast<useconds_t>(c.fast_interval_max - c.fast_interval_min + 1) * 1000000u));
         usleep(wait_us);
         anti_extra::heartbeat_ping(); // L1.21: 检测线程存活心跳
         fast_security_check();
         if (anti_extra::should_exit())
-            _exit(42);
+            _exit(0); // 审计 P2③: 所有静默防线统一退出码 0, 不给"哪条防线打中"的指纹
 
         uint64_t now = ms_now();
         if (now >= next_slow) {
             slow_security_check();
             if (anti_extra::should_exit())
-                _exit(42);
+                _exit(0); // 同上: 统一退出码
             useconds_t sw = static_cast<useconds_t>(c.slow_interval_min) * 1000000u +
                 (tick_xorshift() % (static_cast<useconds_t>(c.slow_interval_max - c.slow_interval_min + 1) * 1000000u));
-            next_slow = now + static_cast<uint64_t>(sw / 1000u);
+            // 审计 P0-1: security_tick(帧)调制慢周期——解密配置真正参与检测节奏
+            next_slow = now + static_cast<uint64_t>(sw / 1000u) + t3::entangled_security_tick();
         }
     }
     return nullptr;
@@ -130,7 +134,7 @@ int main(int argc, char *argv[]) {
     pthread_t security_thread;
     // 审查修复（B13）：线程创建失败 → 防线缺失即退出（否则心跳恒 0、无人告警）
     if (pthread_create(&security_thread, nullptr, security_thread_fn, nullptr) != 0)
-        _exit(42);
+        _exit(0); // 审计 P2③: 统一退出码 0
     // L1.26: inotify 反内存 dump 监控线程（独立线程，不占检测线程）
     anti_extra::start_mem_watch_thread();
 
@@ -166,12 +170,13 @@ int main(int argc, char *argv[]) {
 
     static bool flag = true;
     while (flag) {
-        // L1.14: 每帧检查延迟退出倒计时——检测命中后 20~90 秒内静默 _exit(42)
+        // L1.14: 每帧检查延迟退出倒计时——检测命中后 20~90 秒内静默 _exit(0)
+        // (统一退出码, 见审计 P2③; 含纠缠失败武装的延迟退出)
         if (anti_extra::should_exit())
-            _exit(42);
+            _exit(0);
         // L1.21: 检测线程心跳超时（被 kill/卡死）→ 立即退出（防线不静默失效）
         if (anti_extra::heartbeat_expired())
-            _exit(42);
+            _exit(0);
 
         drawBegin();
         if (permeate_record == false) {

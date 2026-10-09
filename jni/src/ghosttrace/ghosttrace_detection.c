@@ -236,39 +236,39 @@ gt_result_t gt_detect_ptrace(void) {
     }
     
 #elif PLATFORM_ANDROID
-    /* Android ptrace detection - similar to Linux but with Android-specific checks */
-    /* L1.28: 守护进程 SEIZE 占位启用时跳过本探测（同 Linux 分支理由） */
-    if (gt_guard_pid() <= 0) {
-    pid_t child = fork();
-    if (child == 0) {
-        /* Child process */
-        if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
-            /* L1.28: 守护进程 attach 后 fork 的子进程继承 ptrace 状态——TRACEME 必然失败。
-               此时读自身 TracerPid：若 == 守护 pid → 继承自守护，放行（exit 0）。 */
-            int tp = 0;
-            const char* sp = "/proc/self/status";
-            FILE* f = fopen(sp, "r");
-            if (f) {
-                char line[256];
-                while (fgets(line, sizeof(line), f)) {
-                    if (strncmp(line, "TracerPid:", 10) == 0) { tp = atoi(line + 10); break; }
+    /* Android ptrace detection（审查修复 B9v5）：
+       - 移除 Method1 fork+TRACEME 探测：真机实锤误杀——TRACEME 后子进程 exit 产生
+         exit-stop（WIFSTOPPED），父进程 waitpid 一次拿不到 WIFEXITED，WEXITSTATUS
+         误读 stopped 状态字节 → 误判"已被 trace" → arm → 延迟退出（全关 SEC_+GUARD=0
+         只剩 GT 仍 125s 内退出的二分证据）。
+       - 守护占位（L1.28）已挡第三方 attach（EPERM，kxmwp 实测 connection closed）；
+         无守护时本 Method2（TracerPid 白名单）兜底——与 Linux 分支、anti_extra
+         tracerpid_check 同思路。 */
+    /* Method 2: Check /proc/self/status for TracerPid（守护 pid 白名单） */
+    GT_STEALTH_STRING(s_proc_status_a, "\x2A\xCF\x2A\xCB\x2A\xD2\x20\xC7\x2B\xC3\x2E\xDE\x21\xC2\x31\xD2\x36\xD0", 18); // /proc/self/status
+    FILE *status_file = fopen(s_proc_status_a, "r");
+    if (status_file) {
+        char line[256];
+        GT_STEALTH_STRING(s_tracer_pid_a, "\x01\xD3\x24\xC8\x20\xD9\x15\xC2\x21", 9); // TracerPid
+        while (fgets(line, sizeof(line), status_file)) {
+            if (strncmp(line, s_tracer_pid_a, 9) == 0) {
+                int tracer_pid = atoi(line + 10);
+                fclose(status_file);
+                /* L1.28 白名单：守护进程 ptrace 占位后 TracerPid 常态 = 守护 pid（非 0） */
+                if (tracer_pid != 0 && tracer_pid != gt_guard_pid()) {
+                    GT_LOG_WARNING("ptrace detection: TracerPid = %d", tracer_pid);
+                    return GT_ERROR_DEBUGGER_DETECTED;
                 }
-                fclose(f);
+                break;
             }
-            if (tp == gt_guard_pid()) _exit(0);
-            /* ptrace failed, likely already being traced */
-            _exit(1);
         }
-        _exit(0);
-    } else if (child > 0) {
-        /* Parent process */
-        int status;
-        waitpid(child, &status, 0);
-        if (WEXITSTATUS(status) == 1) {
-            GT_LOG_WARNING("ptrace detection: already being traced");
-            return GT_ERROR_DEBUGGER_DETECTED;
-        }
+        fclose(status_file);
     }
+    /* Method 3: debugger 进程名扫描（Android 下 check_debugger_processes 为空实现，
+       进程名精确匹配 gdb/lldb 等；系统进程不受影响，保留兜底） */
+    if (check_debugger_processes()) {
+        GT_LOG_WARNING("ptrace detection: debugger process found");
+        return GT_ERROR_DEBUGGER_DETECTED;
     }
     
 #elif PLATFORM_MACOS
