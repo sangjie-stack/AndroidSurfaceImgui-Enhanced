@@ -777,6 +777,13 @@ bool unicorn_check() {
     if (t0 == t1)
         return false; // 计数器静止 = 模拟时钟
 
+    // ③ CTR_EL0 cache 特征寄存器：真机必非零（DminLine/IminLine 等字段指示 cache line 大小），
+    //    Unicorn 2.1.4 实测返回 0 → 零值 = 模拟器未实现该寄存器（对新版 Unicorn 有效）
+    uint64_t ctr = 0;
+    __asm__ __volatile__("mrs %0, ctr_el0" : "=r"(ctr));
+    if (ctr == 0)
+        return false; // cache 特征为零 = 无真实 cache 语义 = 模拟器
+
     // ② 内核 >= 5.10 时，faccessat2(439)/openat2(437) 返回 ENOSYS → Unicorn 无 hook
     {
         static int kernel_ok = -1; // -1 未判定, 0 不可用, 1 可用
