@@ -1,10 +1,40 @@
 #pragma once
-// 动态防逆向增强（L1.6 / L1.8 / L1.9 / L1.13 / L1.14 / L1.15）
+// 动态防逆向增强（L1.6 / L1.8 / L1.9 / L1.13 / L1.14 / L1.15 / L1.16 / L1.17）
 // 说明：核心逻辑为环境特征检查与自比对，参考 GhostTrace / anti_Android 等开源思路，
 //       不涉及加密/混淆核心逻辑（仍由 Obfuscate / Amice 负责）。
 #include <cstdint>
 
 namespace anti_extra {
+
+// 每项检测均可由环境变量独立控制（默认全开；仅影响本进程，不写全局状态）：
+//   SEC_INJ=0/1         L1.13 行为型注入检测（可执行段白名单）
+//   SEC_MEMFD=0/1       memfd:(deleted) 精确判注入
+//   SEC_THREAD=0/1      L1.17 线程突变检测（线程数超基线+阈值 = 注入）
+//   SEC_INTEGRITY=0/1   L1.6  ELF 完整性自检
+//   SEC_TRACER=0/1      TracerPid 周期轮询（ptrace attach 检测补充）
+//   SEC_SELFCHK=0/1     L1.16 检测规则数据自校验（防 patch 白名单绕过）
+//   SEC_DELAY=min-max   延迟退出窗口秒（默认 20-90）
+//   SEC_THRDBASE=N      线程基线（默认启动后首个周期自动设定）
+//   SEC_THRDLIMIT=N     线程突变阈值（默认 3）
+//   SEC_INTV=min-max    检测周期秒（默认 2-5）
+struct SecurityConfig {
+    bool enable_injected   = true;
+    bool enable_memfd      = true;
+    bool enable_thread     = true;
+    bool enable_integrity  = true;
+    bool enable_tracerpid  = true;
+    bool enable_selfcheck  = true;
+    int  delay_min = 20;          // L1.14 延迟退出窗口下限(秒)
+    int  delay_max = 90;          // L1.14 延迟退出窗口上限(秒)
+    int  thread_baseline = -1;    // L1.17 线程基线（-1=未定，首个周期自动设定）
+    int  thread_threshold = 3;    // L1.17 线程突变阈值（超基线+阈值=注入）
+    int  interval_min = 2;        // L1.15 检测周期下限(秒)
+    int  interval_max = 5;        // L1.15 检测周期上限(秒)
+};
+// 进程级配置单例（main() 最早期 load_sec_cfg_from_env() 后只读）
+SecurityConfig& sec_cfg();
+// 从环境变量加载配置覆盖（未设置的项保持默认）
+void load_sec_cfg_from_env();
 
 // L1.8: 禁止其他进程读取本进程内存（/proc/pid/mem）。
 //       main() 最早调用；root 攻击者仍可绕过（门槛作用）。
@@ -25,6 +55,20 @@ bool frida_extra_check();
 //         非白名单路径可执行段 → 判定注入。
 //       返回 true=干净；false=发现未知可执行映射（注入）。
 bool injected_check();
+
+// L1.17: 线程突变检测（实测：kxmwp memfd 注入 +6 线程，改线程名也躲不掉数量突变）。
+//        首次调用自动设定基线；此后线程数 > 基线+阈值 → 注入。
+//       返回 true=干净；false=线程数异常增长（注入）。
+bool thread_spike_check();
+
+// TracerPid 周期轮询：ptrace attach 时 TracerPid!=0。
+//       返回 true=无调试器；false=被 ptrace attach。
+bool tracerpid_check();
+
+// L1.16: 检测规则数据自校验（白名单前缀表等关键常量哈希比对）。
+//        首次调用记录基线哈希；此后重算比对，不一致 = 检测逻辑被 patch。
+//       返回 true=规则数据完整；false=被篡改。
+bool rules_selfcheck();
 
 // L1.14: 延迟退出机制（防"行为反推"：检测到异常不立即退出，
 //        伪装正常继续运行，随机 20~90 秒后由调用方 _exit(42)）。

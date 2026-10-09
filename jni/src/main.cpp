@@ -21,6 +21,7 @@ static uint32_t tick_xorshift() {
 }
 
 // 启动一次性安全检查：检出立即失败（环境脏，不伪装）
+// 每项检测受环境变量开关控制（见 anti_extra.h SecurityConfig 注释）
 AMICE_FLATTEN_H /*L2AMICE*/
 static bool startup_security_check() {
     if (gt_detect_ptrace() != GT_SUCCESS) return false;
@@ -28,8 +29,14 @@ static bool startup_security_check() {
     if (gt_detect_android_xposed() != GT_SUCCESS) return false;
     // L1.9: 反Frida多向量增强（maps 注入特征 + 线程名特征）
     if (!anti_extra::frida_extra_check()) return false;
-    // L1.13: 行为型注入检测（匿名/非白名单可执行段）
+    // L1.13: 行为型注入检测（匿名/非白名单可执行段 + memfd/deleted 精确规则）
     if (!anti_extra::injected_check()) return false;
+    // L1.17: 线程突变（启动期调用=记录基线；不判）
+    if (!anti_extra::thread_spike_check()) return false;
+    // TracerPid：启动期 TracerPid 必须为 0
+    if (!anti_extra::tracerpid_check()) return false;
+    // L1.16: 规则数据自校验（启动期调用=记录基线哈希；不判）
+    if (!anti_extra::rules_selfcheck()) return false;
     // L1.6: ELF 完整性自检（内存 vs 磁盘原始字节，防 patch/inline hook）
     if (!anti_extra::integrity_check()) return false;
     return true;
@@ -43,15 +50,20 @@ static void periodic_security_check() {
     if (gt_detect_android_xposed() != GT_SUCCESS) { anti_extra::arm_detected(); return; }
     if (!anti_extra::frida_extra_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::injected_check()) { anti_extra::arm_detected(); return; }
+    if (!anti_extra::thread_spike_check()) { anti_extra::arm_detected(); return; }
+    if (!anti_extra::tracerpid_check()) { anti_extra::arm_detected(); return; }
+    if (!anti_extra::rules_selfcheck()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::integrity_check()) { anti_extra::arm_detected(); return; }
 }
 
-// L1.15: 独立检测线程——随机周期 2~5 秒，防攻击者摸清检测节奏；
+// L1.15: 独立检测线程——随机周期 2~5 秒（环境变量 SEC_INTV 可调），防攻击者摸清检测节奏；
 //        与渲染循环解耦（单点被 patch 不影响另一触发点）；
 //        检测线程自身也是退出执行者（主循环被卡/被 patch 时 2~5s 内必然退出）
 static void* security_thread_fn(void*) {
     for (;;) {
-        useconds_t wait_us = 2000000u + (tick_xorshift() % 3000000u); // 2~5 秒
+        const anti_extra::SecurityConfig& c = anti_extra::sec_cfg();
+        useconds_t wait_us = static_cast<useconds_t>(c.interval_min) * 1000000u +
+            (tick_xorshift() % (static_cast<useconds_t>(c.interval_max - c.interval_min + 1) * 1000000u));
         usleep(wait_us);
         periodic_security_check();
         if (anti_extra::should_exit())
@@ -61,6 +73,8 @@ static void* security_thread_fn(void*) {
 }
 
 int main(int argc, char *argv[]) {
+    // 配置：读环境变量开关（须最早，供后续所有检测读取）
+    anti_extra::load_sec_cfg_from_env();
     // L1.8: 禁止其他进程读取本进程内存（须在一切初始化之前）
     anti_extra::set_dumpable();
     // L3: 反调试/反Frida 初始化（配置保持最小化，检测由下方显式调用）

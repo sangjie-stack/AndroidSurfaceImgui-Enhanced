@@ -20,6 +20,51 @@
 
 namespace anti_extra {
 
+// ---------- 配置：环境变量开关（默认全开，可单关/调参） ----------
+namespace {
+SecurityConfig g_cfg;
+std::atomic<bool> g_cfg_loaded{false};
+
+static int env_int(const char* name, int def) {
+    const char* v = ::getenv(name);
+    if (!v || !*v) return def;
+    return atoi(v);
+}
+static bool env_bool(const char* name, bool def) {
+    const char* v = ::getenv(name);
+    if (!v || !*v) return def;
+    return atoi(v) != 0;
+}
+static bool parse_range(const char* v, int& lo, int& hi) {
+    if (!v || !*v) return false;
+    const char* dash = strchr(v, '-');
+    if (!dash) return false;
+    int a = atoi(v), b = atoi(dash + 1);
+    if (a <= 0 || b < a) return false;
+    lo = a; hi = b; return true;
+}
+} // namespace
+
+SecurityConfig& sec_cfg() { return g_cfg; }
+
+void load_sec_cfg_from_env() {
+    if (g_cfg_loaded.load(std::memory_order_relaxed)) return;
+    g_cfg.enable_injected   = env_bool("SEC_INJ", true);
+    g_cfg.enable_memfd      = env_bool("SEC_MEMFD", true);
+    g_cfg.enable_thread     = env_bool("SEC_THREAD", true);
+    g_cfg.enable_integrity  = env_bool("SEC_INTEGRITY", true);
+    g_cfg.enable_tracerpid  = env_bool("SEC_TRACER", true);
+    g_cfg.enable_selfcheck  = env_bool("SEC_SELFCHK", true);
+    int lo = g_cfg.delay_min, hi = g_cfg.delay_max;
+    if (parse_range(::getenv("SEC_DELAY"), lo, hi)) { g_cfg.delay_min = lo; g_cfg.delay_max = hi; }
+    int base = env_int("SEC_THRDBASE", -1);
+    if (base >= 0) g_cfg.thread_baseline = base;
+    g_cfg.thread_threshold = env_int("SEC_THRDLIMIT", 3);
+    lo = g_cfg.interval_min; hi = g_cfg.interval_max;
+    if (parse_range(::getenv("SEC_INTV"), lo, hi)) { g_cfg.interval_min = lo; g_cfg.interval_max = hi; }
+    g_cfg_loaded.store(true, std::memory_order_relaxed);
+}
+
 // ---------- L1.8: 禁止内存 dump（非 root 进程读 /proc/pid/mem 失效） ----------
 void set_dumpable() {
     prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
@@ -273,6 +318,13 @@ bool injected_check() {
 
         if (path.empty()) return false; // 真匿名可执行段 = 注入（正常环境不存在）
 
+        // L1.13 增强：memfd 匿名文件注入（实测 kxmwp：/memfd:kxmwp-agent-64.so (deleted)）
+        if (g_cfg.enable_memfd) {
+            if (starts_with(path, "/memfd:") ||
+                path.find("(deleted)") != std::string::npos)
+                return false; // memfd/已删除文件的可执行段 = 注入
+        }
+
         if (path == "[vdso]") continue;              // 唯一合法匿名可执行映射
         if (path == self) continue;                  // 自身主段/分页
         if (starts_with(path, kSystemWhitePrefixes[0]) ||
@@ -290,6 +342,88 @@ bool injected_check() {
         return false; // 非白名单路径可执行段 = 注入（如 /data/local/tmp 下的 agent.so）
     }
     return true;
+}
+
+// ---------- L1.17: 线程突变检测 ----------
+// 实测（kxmwp memfd 注入）：注入后线程 8→14（+6），线程名可伪装但数量躲不掉。
+// 首次调用自动记录基线（启动稳定后首个周期）；此后 线程数 > 基线+阈值 → 注入。
+AMICE_FLATTEN_H /*L2AMICE*/
+bool thread_spike_check() {
+    if (!g_cfg.enable_thread) return true;
+    DIR* d = opendir("/proc/self/task");
+    if (!d) return true; // 读不到就放行（保守）
+    int count = 0;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_name[0] == '.') continue;
+        ++count;
+    }
+    closedir(d);
+    if (g_cfg.thread_baseline < 0) {
+        g_cfg.thread_baseline = count; // 首个周期设基线
+        return true;
+    }
+    if (count > g_cfg.thread_baseline + g_cfg.thread_threshold)
+        return false; // 线程数突变 = 注入（agent 线程数躲不掉）
+    return true;
+}
+
+// ---------- TracerPid 周期轮询 ----------
+// ptrace attach 后 /proc/self/status 的 TracerPid != 0（补充 GhostTrace 周期复检）
+AMICE_FLATTEN_H /*L2AMICE*/
+bool tracerpid_check() {
+    if (!g_cfg.enable_tracerpid) return true;
+    std::ifstream st("/proc/self/status");
+    std::string line;
+    while (std::getline(st, line)) {
+        if (line.size() >= 9 && line.compare(0, 9, "TracerPid:") == 0) {
+            const char* v = line.c_str() + 9;
+            while (*v == ' ' || *v == '\t') ++v;
+            if (*v != '0') return false; // 被 ptrace attach
+            return true;
+        }
+    }
+    return true; // 读不到也放行（保守）
+}
+
+// ---------- L1.16: 检测规则数据自校验 ----------
+// 对白名单前缀表等关键常量做哈希；首次记录基线，周期重算比对。
+// 防攻击者"往白名单加前缀/改规则"绕过行为型检测（patch 判断逻辑改 .text 抓不到，
+// 但改规则常量 .rodata 必被抓——提高绕过成本）。
+namespace {
+static const char* kSelfCheckRegions[] = {
+    reinterpret_cast<const char*>(kSystemWhitePrefixes),
+    nullptr, // 结束标记
+};
+static uint64_t fnv1a_bytes(const void* data, size_t n) {
+    uint64_t h = 1469598103934665603ULL;
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+static uint64_t rules_hash() {
+    // 白名单前缀表原始字节（含全部指针 + 各字符串）
+    uint64_t h = fnv1a_bytes(kSystemWhitePrefixes, sizeof(kSystemWhitePrefixes));
+    for (auto* p : kSystemWhitePrefixes)
+        h = fnv1a_bytes(p, strlen(p)) ^ (h * 0x100000001b3ULL);
+    return h;
+}
+std::atomic<uint64_t> g_rules_hash_base{0};
+} // namespace
+
+AMICE_FLATTEN_H /*L2AMICE*/
+bool rules_selfcheck() {
+    if (!g_cfg.enable_selfcheck) return true;
+    uint64_t h = rules_hash();
+    uint64_t base = g_rules_hash_base.load(std::memory_order_relaxed);
+    if (base == 0) {
+        g_rules_hash_base.store(h, std::memory_order_relaxed); // 首次记录基线
+        return true;
+    }
+    return h == base; // 规则数据被改 → false
 }
 
 // ---------- L1.14: 延迟退出（防行为反推） ----------
@@ -319,7 +453,11 @@ static uint64_t steady_ms() {
 void arm_detected() {
     // 幂等：已武装不再重置（保证最终一定退出）
     if (g_exit_deadline_ms.load(std::memory_order_relaxed) != 0) return;
-    uint32_t delay_ms = 20000u + (xorshift32() % 70000u); // 20~90 秒随机
+    const SecurityConfig& c = g_cfg;
+    int lo = c.delay_min, hi = c.delay_max;
+    if (hi < lo) hi = lo;
+    uint32_t delay_ms = static_cast<uint32_t>(lo) * 1000u +
+                        (xorshift32() % (static_cast<uint32_t>(hi - lo + 1) * 1000u));
     g_exit_deadline_ms.store(steady_ms() + delay_ms, std::memory_order_relaxed);
 }
 
