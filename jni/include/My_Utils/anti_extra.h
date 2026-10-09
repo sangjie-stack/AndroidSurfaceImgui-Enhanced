@@ -20,6 +20,7 @@ namespace anti_extra {
 //   SEC_SLOW_INTV=min-max 慢周期（完整性重检测）秒（默认 4-8）
 //   SEC_SECCOMP=0/1       L1.24 seccomp-bpf 禁危险 syscall（默认开）
 //   SEC_LIBC=0/1          L1.25 libc inline-hook 检测（默认开）
+//   SEC_MEMWATCH=0/1      L1.26 inotify 反内存 dump（默认开）
 struct SecurityConfig {
     bool enable_injected   = true;
     bool enable_memfd      = true;
@@ -29,6 +30,7 @@ struct SecurityConfig {
     bool enable_selfcheck  = true;
     bool enable_seccomp    = true;
     bool enable_libc       = true;
+    bool enable_memwatch   = true;
     int  delay_min = 20;          // L1.14 延迟退出窗口下限(秒)
     int  delay_max = 90;          // L1.14 延迟退出窗口上限(秒)
     int  thread_baseline = -1;    // L1.17 线程基线（-1=未定，首个周期自动设定）
@@ -92,6 +94,13 @@ void apply_seccomp_filter();
 //        与磁盘 /system/lib64/libc.so 对应偏移原始值——被 inline hook（trampoline 跳转）→ 判异常。
 //       返回 true=libc 干净；false=检测到 libc 被 hook。
 bool libc_hook_check();
+
+// L1.26: inotify 反内存 dump（移植 TUGOhost/anti_Android anti_mem_dump.cpp）。
+//        inotify 监控 /proc/self/mem + /proc/self/pagemap（含每线程）的 IN_ACCESS|IN_OPEN——
+//        任何进程（含 KernelSU root）读本进程内存/pagemap → 检出（root 读 mem 也会触发事件）。
+//        不监控 maps（自身检测会自读 maps，避免误报；且 maps 非直接内存 dump 面）。
+//        main() 早期启动独立监控线程；命中 → arm_detected()（走延迟退出）。
+void start_mem_watch_thread();
 
 // L1.16: 检测规则数据自校验（白名单前缀表等关键常量哈希比对）。
 //        首次调用记录基线哈希；此后重算比对，不一致 = 检测逻辑被 patch。

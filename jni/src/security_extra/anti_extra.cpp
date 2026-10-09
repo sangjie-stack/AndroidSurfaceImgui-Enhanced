@@ -7,10 +7,12 @@
 #include <sys/prctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/inotify.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <pthread.h>
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
@@ -66,6 +68,7 @@ void load_sec_cfg_from_env() {
     g_cfg.enable_selfcheck  = env_bool("SEC_SELFCHK", true);
     g_cfg.enable_seccomp    = env_bool("SEC_SECCOMP", true);
     g_cfg.enable_libc       = env_bool("SEC_LIBC", true);
+    g_cfg.enable_memwatch   = env_bool("SEC_MEMWATCH", true);
     int lo = g_cfg.delay_min, hi = g_cfg.delay_max;
     if (parse_range(::getenv("SEC_DELAY"), lo, hi)) { g_cfg.delay_min = lo; g_cfg.delay_max = hi; }
     int base = env_int("SEC_THRDBASE", -1);
@@ -699,6 +702,58 @@ bool libc_hook_check() {
             return false; // libc 函数头被改 = inline hook
     }
     return true;
+}
+
+// ---------- L1.26: inotify 反内存 dump（移植 TUGOhost/anti_Android anti_mem_dump.cpp） ----------
+// PR_SET_DUMPABLE=0（L1.8）拦不住 KernelSU root 读 /proc/pid/mem；
+// inotify 监控 mem/pagemap 的 IN_ACCESS|IN_OPEN——任何进程读本进程内存都触发事件（含 root）。
+// 独立监控线程（不占检测线程）：阻塞读事件 → arm_detected()（幂等，走延迟退出）。
+// 不监控 maps：自身检测自读 maps 会误报；maps 非直接内存 dump 面。
+namespace {
+static void* mem_watch_thread_fn(void*) {
+    if (!g_cfg.enable_memwatch) return nullptr;
+    for (;;) {
+        long fd = ::syscall(SYS_inotify_init1, 0);
+        if (fd < 0) { usleep(3000000); continue; } // init 失败 3s 后重试（保守不报错）
+
+        long wd_self_mem = ::syscall(SYS_inotify_add_watch, fd, "/proc/self/mem", IN_ACCESS | IN_OPEN);
+        long wd_self_pm  = ::syscall(SYS_inotify_add_watch, fd, "/proc/self/pagemap", IN_ACCESS | IN_OPEN);
+        (void)wd_self_mem; (void)wd_self_pm; // procfs 是否支持 inotify 由真机验证；失败静默继续
+
+        // 线程级 mem/pagemap（/proc/self/task/N/mem）
+        DIR* d = opendir("/proc/self/task");
+        if (d) {
+            struct dirent* e;
+            while ((e = readdir(d)) != nullptr) {
+                if (e->d_name[0] == '.') continue;
+                std::string tp = std::string("/proc/self/task/") + e->d_name;
+                ::syscall(SYS_inotify_add_watch, fd, (tp + "/mem").c_str(), IN_ACCESS | IN_OPEN);
+                ::syscall(SYS_inotify_add_watch, fd, (tp + "/pagemap").c_str(), IN_ACCESS | IN_OPEN);
+            }
+            closedir(d);
+        }
+
+        // 阻塞读事件：任何进程 open/读 mem|pagemap → 事件 → 武装延迟退出
+        char buf[4096];
+        long r = ::syscall(SYS_read, fd, buf, sizeof(buf));
+        if (r > 0) {
+            arm_detected(); // 幂等：内存被 dump → 20~90s 后退出（不立即退，防行为反推）
+            ::syscall(SYS_close, fd);
+            usleep(100000); // 短暂退避后重建 watch（防 watch 被清理/事件风暴）
+        } else {
+            ::syscall(SYS_close, fd);
+        }
+    }
+    return nullptr;
+}
+} // namespace
+
+void start_mem_watch_thread() {
+    if (!g_cfg.enable_memwatch) return;
+    pthread_t t;
+    if (pthread_create(&t, nullptr, mem_watch_thread_fn, nullptr) == 0) {
+        pthread_detach(t);
+    }
 }
 
 // ---------- L1.16: 检测规则数据自校验 ----------

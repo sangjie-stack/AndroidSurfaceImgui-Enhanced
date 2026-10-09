@@ -121,6 +121,8 @@ int main(int argc, char *argv[]) {
     // L1.15: 启动独立检测线程（须在 T3 门禁之前——卡密输入/心跳期间同样处于受保护状态）
     pthread_t security_thread;
     pthread_create(&security_thread, nullptr, security_thread_fn, nullptr);
+    // L1.26: inotify 反内存 dump 监控线程（独立线程，不占检测线程）
+    anti_extra::start_mem_watch_thread();
 
     // T3卡密验证（阻塞终端流程：版本检查/公告/自动登录/手动输入循环）
     // 验证通过后心跳线程已在后台运行；失败直接退出，不进入绘制业务
