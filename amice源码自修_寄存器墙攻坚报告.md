@@ -96,6 +96,21 @@
 
 **调用降低层重构**：参数直接物化进 ABI 寄存器（或按序物化+溢出中转），消除 16 个瞬时临时；配合已就绪的 spill 帧基础设施，即可让这些函数过预算。工作量：`lower_call`/`emit_native_bridge_call`/`emit_parallel_register_moves` 三处重构 + amice 自带测试套件验证（`crates/amice/tests/`）。
 
+
+### 4.4 追加：Call 路径逐层排查（2026-10-09 深夜）
+
+为定位 16 个临时的确切来源，做了两组针对性改造并实测：
+
+| 改造 | 预期 | 实测 |
+|---|---|---|
+| ① `save/restore_native_touched_registers` 改走溢出帧 | 消灭每次调用的 N 个 scratch 临时 | 无变化（该路径本已不是来源） |
+| ② 实参经溢出帧暂存（`NativeArgLoc::Staged`）：逐个物化→存槽→释放临时→按序 load 进 ABI 寄存器 | 峰值从 O(参数数) 降到 O(1) | **仍 `temps=16`** —— 参数物化不是来源 |
+| ③ 全部 31 个直连分配点接入 spill 重试（`alloc_vreg_or_spill`） | 消除"未插桩分配点"爆点 | ✅ **生效**：login `spilled=49`、heartbeat `values=0`（全溢出） |
+
+**结论：16 个临时来自 Call 路径中除参数物化之外的环节**（结果绑定 `native_call_final_returns`、`call_action` 操作数发射、或 ABI 覆盖检查相关的保存集合）。这些环节的分配点已接入 spill 重试（改造③），但它们在**同一条指令内**同时持有，spill 无法在不改变指令语义的前提下削减该瞬时峰值。
+
+**剩余路径（明确、可执行）**：在 `emit_native_bridge_call` 内逐段打印寄存器占用（进入时 / 保存后 / 参数暂存后 / call_action 发射前），定位峰值段，再把该段的分配改为按序使用。这是纯插件侧的定点工作，不需要源码适配。
+
 ## 5. 结论与建议
 
 1. **墙未破，生产零变化**（VMP 仍作用于画像内函数如 fnv1a64）。
