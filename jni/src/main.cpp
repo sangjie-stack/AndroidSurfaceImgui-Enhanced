@@ -1,24 +1,63 @@
+#include "amice_annotate.h"   //L2: amice 混淆注解
 #include "draw.h"    //绘制套
 #include "AndroidImgui.h"     //创建绘制套
 #include "GraphicsManager.h" //获取 当前渲染模式
 #include "obfuscate.h"       //L1: 编译期字符串加密 (adamyaxley/Obfuscate, Unlicense)
-#include "anti_extra.h"      //L1.6/L1.8/L1.9: 完整性自检 + dumpable + 反Frida多向量
+#include "anti_extra.h"      //L1.6/1.8/1.9/1.13/1.14/1.15: 动态防线全套
 #include "t3_gate.h"         //T3卡密验证门禁(终端流程, 官方示例一致)
+#include <pthread.h>
+#include <unistd.h>
 extern "C" {
 #include "ghosttrace.h"      //L3: 反调试/反Frida/反Xposed (GhostTrace, MIT)
 }
 
-// 运行级安全自检：检测到调试器 / Frida / Xposed 时返回 false
-// 注意：不做 root 检测——本程序本身就需要 root 运行
-static bool security_ok() {
+// 轻量随机源（线程局部 xorshift，避免 rand 竞争）
+static thread_local uint32_t g_tick_xs = 0x2545f491u ^ static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_tick_xs));
+static uint32_t tick_xorshift() {
+    uint32_t x = g_tick_xs;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    g_tick_xs = x;
+    return x;
+}
+
+// 启动一次性安全检查：检出立即失败（环境脏，不伪装）
+AMICE_FLATTEN_H /*L2AMICE*/
+static bool startup_security_check() {
     if (gt_detect_ptrace() != GT_SUCCESS) return false;
     if (gt_detect_android_frida() != GT_SUCCESS) return false;
     if (gt_detect_android_xposed() != GT_SUCCESS) return false;
     // L1.9: 反Frida多向量增强（maps 注入特征 + 线程名特征）
     if (!anti_extra::frida_extra_check()) return false;
+    // L1.13: 行为型注入检测（匿名/非白名单可执行段）
+    if (!anti_extra::injected_check()) return false;
     // L1.6: ELF 完整性自检（内存 vs 磁盘原始字节，防 patch/inline hook）
-    if (!anti_extra::integrity_check()) _exit(42); // 专用退出码，静默退出
+    if (!anti_extra::integrity_check()) return false;
     return true;
+}
+
+// 周期安全检查：检出 → 武装延迟退出（伪装正常，防行为反推）
+AMICE_FLATTEN_H /*L2AMICE*/
+static void periodic_security_check() {
+    if (gt_detect_ptrace() != GT_SUCCESS) { anti_extra::arm_detected(); return; }
+    if (gt_detect_android_frida() != GT_SUCCESS) { anti_extra::arm_detected(); return; }
+    if (gt_detect_android_xposed() != GT_SUCCESS) { anti_extra::arm_detected(); return; }
+    if (!anti_extra::frida_extra_check()) { anti_extra::arm_detected(); return; }
+    if (!anti_extra::injected_check()) { anti_extra::arm_detected(); return; }
+    if (!anti_extra::integrity_check()) { anti_extra::arm_detected(); return; }
+}
+
+// L1.15: 独立检测线程——随机周期 2~5 秒，防攻击者摸清检测节奏；
+//        与渲染循环解耦（单点被 patch 不影响另一触发点）；
+//        检测线程自身也是退出执行者（主循环被卡/被 patch 时 2~5s 内必然退出）
+static void* security_thread_fn(void*) {
+    for (;;) {
+        useconds_t wait_us = 2000000u + (tick_xorshift() % 3000000u); // 2~5 秒
+        usleep(wait_us);
+        periodic_security_check();
+        if (anti_extra::should_exit())
+            _exit(42);
+    }
+    return nullptr;
 }
 
 int main(int argc, char *argv[]) {
@@ -28,8 +67,12 @@ int main(int argc, char *argv[]) {
     gt_config_t gt_cfg = {}; // C++ 聚合初始化（含枚举成员，不能用 {0}）
     gt_cfg.stealth_mode = 1; // 静默模式：不打印 GhostTrace 自身标识
     gt_init(&gt_cfg);
-    if (!security_ok())
-        return 0; // 检测到调试环境，直接退出
+    if (!startup_security_check())
+        return 0; // 启动期检测到调试/注入环境，直接退出
+
+    // L1.15: 启动独立检测线程（须在 T3 门禁之前——卡密输入/心跳期间同样处于受保护状态）
+    pthread_t security_thread;
+    pthread_create(&security_thread, nullptr, security_thread_fn, nullptr);
 
     // T3卡密验证（阻塞终端流程：版本检查/公告/自动登录/手动输入循环）
     // 验证通过后心跳线程已在后台运行；失败直接退出，不进入绘制业务
@@ -57,11 +100,10 @@ int main(int argc, char *argv[]) {
     ::init_My_drawdata(); //初始化绘制数据
 
     static bool flag = true;
-    static int security_tick = 0;
     while (flag) {
-        // L3: 周期性复检（约每90帧一次），发现调试器/Frida/Xposed 即退出
-        if ((++security_tick % 90) == 0 && !security_ok())
-            break;
+        // L1.14: 每帧检查延迟退出倒计时——检测命中后 20~90 秒内静默 _exit(42)
+        if (anti_extra::should_exit())
+            _exit(42);
 
         drawBegin();
         if (permeate_record == false) {
