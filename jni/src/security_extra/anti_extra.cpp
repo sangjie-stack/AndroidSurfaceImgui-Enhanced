@@ -6,6 +6,7 @@
 
 #include <sys/prctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -14,6 +15,7 @@
 #include <cstdint>
 
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -89,6 +91,24 @@ static bool str_contains_ci(const std::string& hay, const char* needle) {
     return false;
 }
 
+// ---------- L1.22: syscall 直读 /proc 文件（防 libc hook 伪造输出） ----------
+// 魔改版 frida 可 hook libc 的 fopen/fgets 伪造 maps/status 内容（注入检测读到假数据放行）。
+// 参考 TUGOhost/anti_Android 的 syscall 用法：直接发 openat/read 系统调用，绕过 libc wrapper。
+static bool syscall_read_proc(const char* path, std::string& out) {
+    out.clear();
+    long fd = ::syscall(SYS_openat, AT_FDCWD, path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char buf[4096];
+    for (;;) {
+        long r = ::syscall(SYS_read, fd, buf, sizeof(buf));
+        if (r < 0) { ::syscall(SYS_close, fd); return false; }
+        if (r == 0) break;
+        out.append(buf, static_cast<size_t>(r));
+    }
+    ::syscall(SYS_close, fd);
+    return true;
+}
+
 // ---------- L1.6: ELF 完整性自检 ----------
 struct TextSeg {
     uintptr_t start;
@@ -104,7 +124,9 @@ static bool collect_text_segs(const std::string& self_path, std::vector<TextSeg>
     if (slash != std::string::npos) self_base = self_path.substr(slash + 1);
     else self_base = self_path;
 
-    std::ifstream maps("/proc/self/maps");
+    std::string data;
+    if (!syscall_read_proc("/proc/self/maps", data)) return false;
+    std::istringstream maps(data);
     std::string line;
     while (std::getline(maps, line)) {
         // 格式: start-end perms offset dev inode pathname
@@ -195,7 +217,9 @@ bool integrity_check() {
 // 特征串全部用 Obfuscate 编译期加密 + 即用即毁（不暴露检测点）
 
 static bool scan_maps_frida() {
-    std::ifstream maps("/proc/self/maps");
+    std::string data;
+    if (!syscall_read_proc("/proc/self/maps", data)) return false;
+    std::istringstream maps(data);
     std::string line;
     while (std::getline(maps, line)) {
         {
@@ -229,9 +253,11 @@ static bool scan_threads_frida() {
     while ((e = readdir(d)) != nullptr) {
         if (e->d_name[0] == '.') continue;
         std::string comm_path = std::string("/proc/self/task/") + e->d_name + "/comm";
-        std::ifstream f(comm_path);
-        std::string name;
-        if (std::getline(f, name)) {
+        std::string cdata;
+        if (syscall_read_proc(comm_path.c_str(), cdata)) {
+            // comm 只有一行（可能有尾随换行），取首行
+            size_t nl = cdata.find('\n');
+            std::string name = (nl == std::string::npos) ? cdata : cdata.substr(0, nl);
             {
                 auto& o = AY_OBFUSCATE("gum-js-loop");
                 ay::scoped_plaintext sp(o);
@@ -289,7 +315,9 @@ bool injected_check() {
     selfpath[n] = '\0';
     std::string self(selfpath);
 
-    std::ifstream maps("/proc/self/maps");
+    std::string data;
+    if (!syscall_read_proc("/proc/self/maps", data)) return true; // 读不到就放行（保守）
+    std::istringstream maps(data);
     std::string line;
     while (std::getline(maps, line)) {
         // 格式: start-end perms offset dev inode pathname
@@ -374,7 +402,9 @@ bool thread_spike_check() {
 AMICE_FLATTEN_H /*L2AMICE*/
 bool tracerpid_check() {
     if (!g_cfg.enable_tracerpid) return true;
-    std::ifstream st("/proc/self/status");
+    std::string data;
+    if (!syscall_read_proc("/proc/self/status", data)) return true; // 读不到就放行（保守）
+    std::istringstream st(data);
     std::string line;
     while (std::getline(st, line)) {
         if (line.size() >= 9 && line.compare(0, 9, "TracerPid:") == 0) {
@@ -385,6 +415,118 @@ bool tracerpid_check() {
         }
     }
     return true; // 读不到也放行（保守）
+}
+
+// ---------- L1.23: RELRO/GOT 段权限检测（防 PLT hook 企图） ----------
+// 编译已带 -z,relro,-z,now（full RELRO）→ GOT 只读，字节跳动 bhook 类 PLT hook 写 GOT 会失败。
+// 攻击者要 PLT hook 必须先 mprotect 解除 RELRO 只读 → 本检测抓"RELRO 段被降级为可写"。
+// 实现：从磁盘 /proc/self/exe 解析 PT_GNU_RELRO 段（静态信息，无运行时竞态）；
+//       周期比对 maps 中该范围权限——出现 'w' = RELRO 被解除 = hook 企图。
+AMICE_FLATTEN_H /*L2AMICE*/
+bool relro_check() {
+    // 快照：自身路径 + 磁盘解析出的 RELRO 运行地址范围（首次调用建立，之后复用）
+    static std::string relro_self;
+    static uintptr_t relro_start = 0;
+    static size_t relro_len = 0;
+    static bool parsed = false;
+
+    if (!parsed) {
+        char selfpath[512];
+        ssize_t n = readlink("/proc/self/exe", selfpath, sizeof(selfpath) - 1);
+        if (n <= 0) return true;
+        selfpath[n] = '\0';
+        relro_self.assign(selfpath);
+        std::string self_base;
+        size_t slash = relro_self.rfind('/');
+        if (slash != std::string::npos) self_base = relro_self.substr(slash + 1);
+        else self_base = relro_self;
+
+        std::string exe;
+        if (!syscall_read_proc("/proc/self/exe", exe)) return true;
+        if (exe.size() < 64) return true;
+        // ELF64 header: e_phoff@0x20(8) e_phentsize@0x36(2) e_phnum@0x38(2)
+        const unsigned char* h = reinterpret_cast<const unsigned char*>(exe.data());
+        uint64_t phoff = 0; for (int i = 0; i < 8; ++i) phoff |= static_cast<uint64_t>(h[0x20 + i]) << (8 * i);
+        unsigned phent = h[0x36] | (h[0x37] << 8);
+        unsigned phnum = h[0x38] | (h[0x39] << 8);
+        uint64_t relro_vaddr = 0, relro_memsz = 0;
+        for (unsigned i = 0; i < phnum; ++i) {
+            size_t off = static_cast<size_t>(phoff + i * phent);
+            if (off + 48 > exe.size()) break;
+            const unsigned char* ph = reinterpret_cast<const unsigned char*>(exe.data() + off);
+            uint32_t ptype = ph[0] | (ph[1] << 8) | (ph[2] << 16) | (ph[3] << 24);
+            if (ptype == 0x6474e552u) { // PT_GNU_RELRO
+                for (int k = 0; k < 8; ++k) {
+                    relro_vaddr |= static_cast<uint64_t>(ph[16 + k]) << (8 * k);
+                    relro_memsz |= static_cast<uint64_t>(ph[40 + k]) << (8 * k);
+                }
+                break;
+            }
+        }
+        if (relro_memsz == 0) return true; // 无 RELRO（理论上不该发生，防御性放行）
+
+        // PIE 基址 = maps 中自身映射段的最小 start（仅当该段 offset==0 且路径匹配）
+        std::string maps;
+        if (!syscall_read_proc("/proc/self/maps", maps)) return true;
+        uintptr_t base = 0;
+        std::istringstream mss(maps);
+        std::string line;
+        while (std::getline(mss, line)) {
+            size_t p0 = line.find('-');
+            if (p0 == std::string::npos) continue;
+            size_t p1 = line.find(' ', p0);
+            size_t p2 = line.find(' ', p1 + 1);
+            if (p2 == std::string::npos) continue;
+            std::string perms = line.substr(p1 + 1, p2 - p1 - 1);
+            size_t p3 = line.find(' ', p2 + 1);
+            if (p3 == std::string::npos) continue;
+            uint64_t off = strtoull(line.substr(p2 + 1, p3 - p2 - 1).c_str(), nullptr, 16);
+            if (off != 0) continue; // 只认文件偏移 0 的基址段
+            size_t p4 = line.find(' ', p3 + 1), p5 = line.find(' ', p4 + 1);
+            if (p5 == std::string::npos) continue;
+            std::string path;
+            if (p5 + 1 < line.size()) path = line.substr(p5 + 1);
+            size_t pb = path.find_first_not_of(" \t");
+            if (pb == std::string::npos) continue;
+            path = path.substr(pb);
+            if (path.empty()) continue;
+            bool match = (path == relro_self);
+            if (!match) {
+                size_t lp = path.rfind('/');
+                std::string pb2 = (lp == std::string::npos) ? path : path.substr(lp + 1);
+                if (pb2 == self_base) match = true;
+            }
+            if (!match) continue;
+            base = strtoull(line.substr(0, p0).c_str(), nullptr, 16);
+            break;
+        }
+        if (base == 0) return true;
+
+        relro_start = base + (relro_vaddr & ~(uint64_t)0xfffULL);
+        relro_len = static_cast<size_t>(relro_memsz);
+        parsed = true;
+    }
+
+    // 周期比对：maps 中覆盖 RELRO 范围的段是否被降级为可写
+    std::string maps;
+    if (!syscall_read_proc("/proc/self/maps", maps)) return true;
+    std::istringstream mss(maps);
+    std::string line;
+    uintptr_t relro_end = relro_start + relro_len;
+    while (std::getline(mss, line)) {
+        size_t p0 = line.find('-');
+        if (p0 == std::string::npos) continue;
+        size_t p1 = line.find(' ', p0);
+        if (p1 == std::string::npos) continue;
+        uintptr_t start = strtoull(line.substr(0, p0).c_str(), nullptr, 16);
+        uintptr_t end = strtoull(line.substr(p0 + 1, p1 - p0 - 1).c_str(), nullptr, 16);
+        // 只关心自身映射（RELRO 属于本程序）——地址重叠即可（maps 仅本进程，重叠必属自身）
+        if (end <= relro_start || start >= relro_end) continue;
+        std::string perms = line.substr(p1 + 1, line.find(' ', p1 + 1) - p1 - 1);
+        if (perms.find('w') != std::string::npos)
+            return false; // RELRO 只读段被解除为可写 = PLT hook 企图
+    }
+    return true;
 }
 
 // ---------- L1.16: 检测规则数据自校验 ----------

@@ -65,6 +65,12 @@ bool thread_spike_check();
 //       返回 true=无调试器；false=被 ptrace attach。
 bool tracerpid_check();
 
+// L1.23: RELRO/GOT 段权限检测（防 PLT hook 企图——字节跳动 bhook 类）。
+//        编译已带 -z,relro,-z,now（full RELRO，GOT 只读）；攻击者要 PLT hook
+//        必须先 mprotect 解除 RELRO → 检测该段被降级为可写。
+//       返回 true=RELRO 完整；false=RELRO 段意外可写（hook 企图）。
+bool relro_check();
+
 // L1.16: 检测规则数据自校验（白名单前缀表等关键常量哈希比对）。
 //        首次调用记录基线哈希；此后重算比对，不一致 = 检测逻辑被 patch。
 //       返回 true=规则数据完整；false=被篡改。

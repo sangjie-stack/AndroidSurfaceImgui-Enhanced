@@ -37,6 +37,8 @@ static bool startup_security_check() {
     if (!anti_extra::tracerpid_check()) return false;
     // L1.16: 规则数据自校验（启动期调用=记录基线哈希；不判）
     if (!anti_extra::rules_selfcheck()) return false;
+    // L1.23: RELRO 段权限（启动期解析快照；不判）
+    if (!anti_extra::relro_check()) return false;
     // L1.6: ELF 完整性自检（内存 vs 磁盘原始字节，防 patch/inline hook）
     if (!anti_extra::integrity_check()) return false;
     return true;
@@ -53,6 +55,7 @@ static void periodic_security_check() {
     if (!anti_extra::thread_spike_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::tracerpid_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::rules_selfcheck()) { anti_extra::arm_detected(); return; }
+    if (!anti_extra::relro_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::integrity_check()) { anti_extra::arm_detected(); return; }
 }
 
