@@ -215,6 +215,34 @@ namespace ay
 		bool m_encrypted{ true };
 	};
 
+	// RAII helper: decrypt on construction, re-encrypt on destruction.
+	// Use-and-destroy: the plaintext window is minimized to the scope.
+	template <typename OBF>
+	class scoped_plaintext
+	{
+	public:
+		explicit scoped_plaintext(OBF& obf) : m_obf(obf)
+		{
+			m_obf.decrypt();
+		}
+
+		~scoped_plaintext()
+		{
+			m_obf.encrypt();
+		}
+
+		scoped_plaintext(const scoped_plaintext&) = delete;
+		scoped_plaintext& operator=(const scoped_plaintext&) = delete;
+
+		operator const char* () const
+		{
+			return m_obf;
+		}
+
+	private:
+		OBF& m_obf;
+	};
+
 	// This function exists purely to extract the number of elements 'N' in the
 	// array 'data'
 	template <size_type N, key_type KEY = AY_OBFUSCATE_DEFAULT_KEY, typename CHAR_TYPE = char>

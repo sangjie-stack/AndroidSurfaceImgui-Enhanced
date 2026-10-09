@@ -1014,9 +1014,17 @@ namespace ImGui {
             return false;
         }
         *filename++ = '/';
-        strcpy(filename, AY_OBFUSCATE("NotoSansCJK-Regular.ttc"));
+        {
+            auto& ay_obf_ = AY_OBFUSCATE("NotoSansCJK-Regular.ttc");
+            ay::scoped_plaintext ay_sp_(ay_obf_);
+            strcpy(filename, (const char*)ay_sp_);
+        }
         if (access(path, R_OK) != 0) {
-            strcpy(filename, AY_OBFUSCATE("NotoSerifCJK-Regular.ttc"));
+            {
+                auto& ay_obf_ = AY_OBFUSCATE("NotoSerifCJK-Regular.ttc");
+                ay::scoped_plaintext ay_sp_(ay_obf_);
+                strcpy(filename, (const char*)ay_sp_);
+            }
             if (access(path, R_OK) != 0) {
                 return false;
             }

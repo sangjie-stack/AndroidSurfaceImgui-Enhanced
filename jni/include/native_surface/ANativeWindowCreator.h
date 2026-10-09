@@ -103,10 +103,14 @@
 #endif
 
 #define ResolveMethod(ClassName, MethodName, Handle, MethodSignature)                                                                    \
-    ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>(symbolMethod.Find(Handle, MethodSignature));       \
-    if (nullptr == ClassName##__##MethodName)                                                                                            \
-    {                                                                                                                                    \
-        SURFACE_LOG_ERROR("Method not found: %s -> %s::%s", (const char*)MethodSignature, #ClassName, #MethodName); \
+    {                                                                                                                                   \
+        auto& ay_obf_ = MethodSignature;                                                                                                \
+        ay::scoped_plaintext ay_sp_(ay_obf_);                                                                                           \
+        ClassName##__##MethodName = reinterpret_cast<decltype(ClassName##__##MethodName)>(symbolMethod.Find(Handle, (const char*)ay_sp_)); \
+        if (nullptr == ClassName##__##MethodName)                                                                                       \
+        {                                                                                                                               \
+            SURFACE_LOG_ERROR("Method not found: %s -> %s::%s", (const char*)ay_sp_, #ClassName, #MethodName); \
+        }                                                                                                                               \
     }
 
 namespace android {
@@ -267,7 +271,11 @@ namespace android {
             {
                 std::string systemVersionString(128, 0);
 
-                systemVersionString.resize(__system_property_get(AY_OBFUSCATE("ro.build.version.release"), systemVersionString.data()));
+                {
+                    auto& ay_obf_ = AY_OBFUSCATE("ro.build.version.release");
+                    ay::scoped_plaintext ay_sp_(ay_obf_);
+                    systemVersionString.resize(__system_property_get((const char*)ay_sp_, systemVersionString.data()));
+                }
                 if (!systemVersionString.empty())
                     systemVersion = std::stoi(systemVersionString);
 
@@ -277,12 +285,30 @@ namespace android {
                     return;
                 }
 
+                void* libgui = nullptr;
+                void* libutils = nullptr;
 #ifdef __LP64__
-                auto libgui = symbolMethod.Open(AY_OBFUSCATE("/system/lib64/libgui.so"), RTLD_LAZY);
-                auto libutils = symbolMethod.Open(AY_OBFUSCATE("/system/lib64/libutils.so"), RTLD_LAZY);
+                {
+                    auto& ay_obf_ = AY_OBFUSCATE("/system/lib64/libgui.so");
+                    ay::scoped_plaintext ay_sp_(ay_obf_);
+                    libgui = symbolMethod.Open((const char*)ay_sp_, RTLD_LAZY);
+                }
+                {
+                    auto& ay_obf_ = AY_OBFUSCATE("/system/lib64/libutils.so");
+                    ay::scoped_plaintext ay_sp_(ay_obf_);
+                    libutils = symbolMethod.Open((const char*)ay_sp_, RTLD_LAZY);
+                }
 #else
-                auto libgui = symbolMethod.Open(AY_OBFUSCATE("/system/lib/libgui.so"), RTLD_LAZY);
-                auto libutils = symbolMethod.Open(AY_OBFUSCATE("/system/lib/libutils.so"), RTLD_LAZY);
+                {
+                    auto& ay_obf_ = AY_OBFUSCATE("/system/lib/libgui.so");
+                    ay::scoped_plaintext ay_sp_(ay_obf_);
+                    libgui = symbolMethod.Open((const char*)ay_sp_, RTLD_LAZY);
+                }
+                {
+                    auto& ay_obf_ = AY_OBFUSCATE("/system/lib/libutils.so");
+                    ay::scoped_plaintext ay_sp_(ay_obf_);
+                    libutils = symbolMethod.Open((const char*)ay_sp_, RTLD_LAZY);
+                }
 #endif
                 //libutils
                 ResolveMethod(RefBase, IncStrong, libutils, AY_OBFUSCATE("_ZNK7android7RefBase9incStrongEPKv"));
@@ -327,18 +353,22 @@ namespace android {
                 
                 // MirrorSurface method - Android 11+
                 if (11 <= systemVersion) {
-                    SurfaceComposerClient__MirrorSurface =
-                        reinterpret_cast<decltype(SurfaceComposerClient__MirrorSurface)>(
-                            symbolMethod.Find(
-                                libgui,
-                                AY_OBFUSCATE("_ZN7android21SurfaceComposerClient13mirrorSurfaceEPNS_14SurfaceControlE")));
+                    {
+                        auto& ay_obf_ = AY_OBFUSCATE("_ZN7android21SurfaceComposerClient13mirrorSurfaceEPNS_14SurfaceControlE");
+                        ay::scoped_plaintext ay_sp_(ay_obf_);
+                        SurfaceComposerClient__MirrorSurface =
+                            reinterpret_cast<decltype(SurfaceComposerClient__MirrorSurface)>(
+                                symbolMethod.Find(libgui, (const char*)ay_sp_));
+                    }
                     if (SurfaceComposerClient__MirrorSurface == nullptr) {
-                        SurfaceComposerClient__MirrorSurfaceWithParent =
-                            reinterpret_cast<decltype(
-                                SurfaceComposerClient__MirrorSurfaceWithParent)>(
-                                symbolMethod.Find(
-                                    libgui,
-                                    AY_OBFUSCATE("_ZN7android21SurfaceComposerClient13mirrorSurfaceEPNS_14SurfaceControlES2_")));
+                        {
+                            auto& ay_obf_ = AY_OBFUSCATE("_ZN7android21SurfaceComposerClient13mirrorSurfaceEPNS_14SurfaceControlES2_");
+                            ay::scoped_plaintext ay_sp_(ay_obf_);
+                            SurfaceComposerClient__MirrorSurfaceWithParent =
+                                reinterpret_cast<decltype(
+                                    SurfaceComposerClient__MirrorSurfaceWithParent)>(
+                                    symbolMethod.Find(libgui, (const char*)ay_sp_));
+                        }
                     }
                     if (SurfaceComposerClient__MirrorSurface == nullptr &&
                         SurfaceComposerClient__MirrorSurfaceWithParent == nullptr) {
@@ -1090,7 +1120,13 @@ namespace android {
             // Create Surface
             auto surfaceControl = surfaceComposerClient.CreateSurface(name, width, height, 0, skipScrenshot_);
             if (!surfaceControl.data) {
-                __android_log_print(ANDROID_LOG_ERROR, AY_OBFUSCATE("ImGui"), AY_OBFUSCATE("[-] Failed to create surface control for: %s"), name);
+                {
+                    auto& ay_tag_ = AY_OBFUSCATE("ImGui");
+                    auto& ay_fmt_ = AY_OBFUSCATE("[-] Failed to create surface control for: %s");
+                    ay::scoped_plaintext ay_sp_tag_(ay_tag_);
+                    ay::scoped_plaintext ay_sp_fmt_(ay_fmt_);
+                    __android_log_print(ANDROID_LOG_ERROR, (const char*)ay_sp_tag_, (const char*)ay_sp_fmt_, name);
+                }
                 return nullptr;
             }
 
@@ -1154,7 +1190,12 @@ namespace android {
                 return;
 
             // Run "dumpsys display" and get result
-            auto pipe = popen(AY_OBFUSCATE("dumpsys display"), "r");
+            FILE* pipe = nullptr;
+            {
+                auto& ay_obf_ = AY_OBFUSCATE("dumpsys display");
+                ay::scoped_plaintext ay_sp_(ay_obf_);
+                pipe = popen((const char*)ay_sp_, "r");
+            }
             if (!pipe)
             {
                 SURFACE_LOG_ERROR("Failed to run display query");
