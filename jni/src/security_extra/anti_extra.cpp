@@ -6,6 +6,7 @@
 
 #include <sys/prctl.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <cstdlib>
 #include <cstring>
@@ -49,6 +50,12 @@ struct TextSeg {
 
 // 解析 /proc/self/maps，收集"自身可执行文件"的可执行映射段
 static bool collect_text_segs(const std::string& self_path, std::vector<TextSeg>& segs) {
+    // basename 兜底匹配：容忍 maps 中 pathname 与 readlink 结果的微小差异
+    std::string self_base;
+    size_t slash = self_path.rfind('/');
+    if (slash != std::string::npos) self_base = self_path.substr(slash + 1);
+    else self_base = self_path;
+
     std::ifstream maps("/proc/self/maps");
     std::string line;
     while (std::getline(maps, line)) {
@@ -76,7 +83,15 @@ static bool collect_text_segs(const std::string& self_path, std::vector<TextSeg>
         std::string path;
         if (p5 + 1 < line.size()) path = line.substr(p5 + 1);
         if (path.empty()) continue;             // 匿名映射跳过
-        if (path != self_path) continue;        // 只比对自身
+
+        // 匹配自身：完整路径 或 basename 均算命中（防 readlink/maps 格式微小差异导致漏检）
+        bool match = (path == self_path);
+        if (!match && !self_base.empty()) {
+            size_t lp = path.rfind('/');
+            std::string path_base = (lp == std::string::npos) ? path : path.substr(lp + 1);
+            if (path_base == self_base) match = true;
+        }
+        if (!match) continue;
 
         segs.push_back({start, static_cast<size_t>(end - start), off});
     }
@@ -93,21 +108,35 @@ bool integrity_check() {
     std::string self(selfpath);
 
     std::vector<TextSeg> segs;
-    if (!collect_text_segs(self, segs)) return true; // 解析不到也放行
+    if (!collect_text_segs(self, segs)) return true; // 解析不到也放行（保守，防误杀）
 
-    std::ifstream disk("/proc/self/exe", std::ios::binary);
-    if (!disk) return true;
+    // 用系统调用循环读磁盘，确保完整读取（ifstream 缓冲在 -O3/大段下可能短读导致误放行）
+    int fd = ::open("/proc/self/exe", O_RDONLY);
+    if (fd < 0) return true; // 打不开也放行（保守）
 
+    bool ok = true;
     for (const auto& seg : segs) {
+        // 段大小异常（>64MB 不可能出现在自身 ELF）视为异常 → 判定篡改
+        if (seg.size == 0 || seg.size > (64u << 20)) { ok = false; break; }
+
+        if (::lseek(fd, static_cast<off_t>(seg.file_off), SEEK_SET) < 0) { ok = false; break; }
+
         std::vector<char> buf(seg.size);
-        disk.clear();
-        disk.seekg(static_cast<std::streamoff>(seg.file_off));
-        if (!disk.read(buf.data(), static_cast<std::streamsize>(seg.size)))
-            continue; // 读不到完整段（异常情况）放行该段
-        if (memcmp(reinterpret_cast<const void*>(seg.start), buf.data(), seg.size) != 0)
-            return false; // 内存被篡改！
+        size_t got = 0;
+        while (got < seg.size) {
+            ssize_t r = ::read(fd, buf.data() + got, seg.size - got);
+            if (r <= 0) { ok = false; break; } // 读不完整 = 磁盘异常（文件被改/替换）→ 判定篡改
+            got += static_cast<size_t>(r);
+        }
+        if (!ok) break;
+
+        if (memcmp(reinterpret_cast<const void*>(seg.start), buf.data(), seg.size) != 0) {
+            ok = false; // 内存被篡改！
+            break;
+        }
     }
-    return true;
+    ::close(fd);
+    return ok;
 }
 
 // ---------- L1.9: 反 Frida 多向量 ----------
