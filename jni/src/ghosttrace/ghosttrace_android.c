@@ -279,8 +279,15 @@ gt_result_t gt_detect_android_frida(void) {
                     char cmdline[256];
                     if (fgets(cmdline, sizeof(cmdline), fp)) {
                         GT_STEALTH_STRING(s_frida, "\x33\xD8\x3C\xCE\x34", 5); // frida
-                        if (strstr(cmdline, s_frida) || strstr(cmdline, "gum-js-loop")) {
-                            GT_LOG_WARNING("Frida detected in process: %s", cmdline);
+                        /* C: 其他调试服务器——lldb-server/gdbserver（Android 官方调试服务器）
+                           / android_server（IDA 调试服务器，64 位版名含该子串） */
+                        GT_STEALTH_STRING(s_lldbsrv, "\x39\xC6\x31\xC8\x78\xD9\x30\xD8\x23\xCF\x27", 11); // lldb-server
+                        GT_STEALTH_STRING(s_gdbsrv, "\x32\xCE\x37\xD9\x30\xD8\x23\xCF\x27", 9);          // gdbserver
+                        GT_STEALTH_STRING(s_ida_srv, "\x34\xC4\x31\xD8\x3A\xC3\x31\xF5\x26\xCF\x27\xDC\x30\xD8", 14); // android_server
+                        if (strstr(cmdline, s_frida) || strstr(cmdline, "gum-js-loop") ||
+                            strstr(cmdline, s_lldbsrv) || strstr(cmdline, s_gdbsrv) ||
+                            strstr(cmdline, s_ida_srv)) {
+                            GT_LOG_WARNING("Debugger server detected in process: %s", cmdline);
                             fclose(fp);
                             closedir(proc_dir);
                             return GT_ERROR_GENERIC;

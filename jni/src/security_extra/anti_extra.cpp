@@ -317,9 +317,24 @@ static bool scan_threads_frida() {
 }
 
 AMICE_FLATTEN_H /*L2AMICE*/
+// ---------- A: IDA android_server 检测（23946 端口 + 服务器文件） ----------
+// IDA 动态调试 native 必须先推送 android_server 到 /data/local/tmp 并监听 23946。
+// 23946 = 0x5D8A（/proc/net/tcp 本地端口为小端十六进制）。root 下可改名/换端口规避——
+// 此处是低成本兜底面（进程名检测另有 GT 侧，见 ghosttrace_android.c）。
+static bool scan_ida_server() {
+    std::string data;
+    if (!syscall_read_proc("/proc/net/tcp", data)) return false; // 读失败放行（保守）
+    if (data.find(":5D8A ") != std::string::npos) return true;    // 23946 LISTEN
+    // 服务器二进制（常见名 android_server / android_server64）——文件存在即视为调试环境
+    if (::syscall(SYS_faccessat, AT_FDCWD, "/data/local/tmp/android_server", F_OK) == 0) return true;
+    if (::syscall(SYS_faccessat, AT_FDCWD, "/data/local/tmp/android_server64", F_OK) == 0) return true;
+    return false;
+}
+
 bool frida_extra_check() {
     if (scan_maps_frida()) return false;
     if (scan_threads_frida()) return false;
+    if (scan_ida_server()) return false;   // A: IDA 调试服务器
     return true;
 }
 
