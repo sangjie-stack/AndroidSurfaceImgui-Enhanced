@@ -5,6 +5,7 @@
 #include "obfuscate.h" // 检测特征串加密，避免静态暴露检测点
 
 #include <sys/prctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -459,12 +460,59 @@ void arm_detected() {
     uint32_t delay_ms = static_cast<uint32_t>(lo) * 1000u +
                         (xorshift32() % (static_cast<uint32_t>(hi - lo + 1) * 1000u));
     g_exit_deadline_ms.store(steady_ms() + delay_ms, std::memory_order_relaxed);
+    freeze_detectors(); // L1.18: 武装后冻结检测函数页，防延迟窗口内被 patch 绕过
 }
 
 bool should_exit() {
     uint64_t d = g_exit_deadline_ms.load(std::memory_order_relaxed);
     if (d == 0) return false;
     return steady_ms() >= d;
+}
+
+// ---------- L1.21: 检测线程心跳监控 ----------
+// 检测线程每周期 ping；主循环查超时——检测线程被 kill 后防线不会"静默失效"。
+namespace {
+std::atomic<uint64_t> g_hb_ts_ms{0};
+static int hb_timeout_ms() {
+    const char* v = ::getenv("SEC_HB_TIMEOUT");
+    int t = (v && *v) ? atoi(v) : 10;
+    if (t < 3) t = 3; // 下限 3s（检测周期 2~6s 的 2 倍余量）
+    return t * 1000;
+}
+} // namespace
+
+void heartbeat_ping() {
+    g_hb_ts_ms.store(steady_ms(), std::memory_order_relaxed);
+}
+
+bool heartbeat_expired() {
+    uint64_t ts = g_hb_ts_ms.load(std::memory_order_relaxed);
+    if (ts == 0) return false; // 检测线程尚未首跑（渲染循环开始时已 ping 过，正常不会为 0）
+    return (steady_ms() - ts) > static_cast<uint64_t>(hb_timeout_ms());
+}
+
+// ---------- L1.18: armed 后冻结检测函数 ----------
+// 参考 protect_memory_segments（关键代码段只读）：延迟退出窗口内，
+// 检测函数所在页 mprotect(PROT_READ|PROT_EXEC)——攻击者无法 inline-patch
+// "最终必退"判定（要 patch 必须先改页权限，mprotect 动作本身可被监控/提高成本）。
+void freeze_detectors() {
+    static std::atomic<bool> done{false};
+    if (done.exchange(true)) return; // 只冻结一次（幂等）
+    uintptr_t addrs[] = {
+        reinterpret_cast<uintptr_t>(&integrity_check),
+        reinterpret_cast<uintptr_t>(&injected_check),
+        reinterpret_cast<uintptr_t>(&thread_spike_check),
+        reinterpret_cast<uintptr_t>(&tracerpid_check),
+        reinterpret_cast<uintptr_t>(&rules_selfcheck),
+        reinterpret_cast<uintptr_t>(&frida_extra_check),
+    };
+    uintptr_t last_page = 0;
+    for (uintptr_t a : addrs) {
+        uintptr_t page = a & ~(uintptr_t)0xfffULL;
+        if (page == 0 || page == last_page) continue;
+        last_page = page;
+        ::mprotect(reinterpret_cast<void*>(page), 4096, PROT_READ | PROT_EXEC);
+    }
 }
 
 } // namespace anti_extra

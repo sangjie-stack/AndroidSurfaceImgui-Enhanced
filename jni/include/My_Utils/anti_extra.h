@@ -70,6 +70,16 @@ bool tracerpid_check();
 //       返回 true=规则数据完整；false=被篡改。
 bool rules_selfcheck();
 
+// L1.21: 检测线程心跳监控（防检测线程被 kill 后防线全失效——Promon watchdog 思路）。
+// 检测线程每周期 heartbeat_ping()；主渲染循环每帧 heartbeat_expired()，
+// 超时（SEC_HB_TIMEOUT 秒，默认 10）= 检测线程已死/被 kill → 主循环直接 _exit(42)。
+void heartbeat_ping();
+bool heartbeat_expired();
+
+// L1.18: armed 后冻结检测函数（mprotect 只读 RX，参考 protect_memory_segments 思路）。
+// 延迟退出窗口内检测函数不可写——防攻击者 inline-patch 掉"最终必退"逻辑。
+void freeze_detectors();
+
 // L1.14: 延迟退出机制（防"行为反推"：检测到异常不立即退出，
 //        伪装正常继续运行，随机 20~90 秒后由调用方 _exit(42)）。
 //        detect 命中后调用 arm_detected()（幂等，只武装一次）。

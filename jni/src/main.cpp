@@ -65,6 +65,7 @@ static void* security_thread_fn(void*) {
         useconds_t wait_us = static_cast<useconds_t>(c.interval_min) * 1000000u +
             (tick_xorshift() % (static_cast<useconds_t>(c.interval_max - c.interval_min + 1) * 1000000u));
         usleep(wait_us);
+        anti_extra::heartbeat_ping(); // L1.21: 检测线程存活心跳
         periodic_security_check();
         if (anti_extra::should_exit())
             _exit(42);
@@ -117,6 +118,9 @@ int main(int argc, char *argv[]) {
     while (flag) {
         // L1.14: 每帧检查延迟退出倒计时——检测命中后 20~90 秒内静默 _exit(42)
         if (anti_extra::should_exit())
+            _exit(42);
+        // L1.21: 检测线程心跳超时（被 kill/卡死）→ 立即退出（防线不静默失效）
+        if (anti_extra::heartbeat_expired())
             _exit(42);
 
         drawBegin();
