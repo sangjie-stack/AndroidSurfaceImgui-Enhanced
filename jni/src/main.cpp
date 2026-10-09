@@ -120,12 +120,17 @@ int main(int argc, char *argv[]) {
     gt_config_t gt_cfg = {}; // C++ 聚合初始化（含枚举成员，不能用 {0}）
     gt_cfg.stealth_mode = 1; // 静默模式：不打印 GhostTrace 自身标识
     gt_init(&gt_cfg);
+    // 审查修复（B18）：启动期检测命中不再立即 return 0——秒级"启动即退"会让攻击者
+    // 快速二分定位启动期检测点。统一走 arm_detected() 延迟退出（20~90s 随机静默退出），
+    // 启动期与运行期迷惑性一致。
     if (!startup_security_check())
-        return 0; // 启动期检测到调试/注入环境，直接退出
+        anti_extra::arm_detected();
 
     // L1.15: 启动独立检测线程（须在 T3 门禁之前——卡密输入/心跳期间同样处于受保护状态）
     pthread_t security_thread;
-    pthread_create(&security_thread, nullptr, security_thread_fn, nullptr);
+    // 审查修复（B13）：线程创建失败 → 防线缺失即退出（否则心跳恒 0、无人告警）
+    if (pthread_create(&security_thread, nullptr, security_thread_fn, nullptr) != 0)
+        _exit(42);
     // L1.26: inotify 反内存 dump 监控线程（独立线程，不占检测线程）
     anti_extra::start_mem_watch_thread();
 

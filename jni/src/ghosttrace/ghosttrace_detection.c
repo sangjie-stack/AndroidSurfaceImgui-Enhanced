@@ -190,11 +190,11 @@ gt_result_t gt_detect_ptrace(void) {
                 }
                 fclose(f);
             }
-            if (tp == gt_guard_pid()) exit(0);
+            if (tp == gt_guard_pid()) _exit(0);
             /* ptrace failed, likely already being traced */
-            exit(1);
+            _exit(1);
         }
-        exit(0);
+        _exit(0);
     } else if (child > 0) {
         /* Parent process */
         int status;
@@ -255,11 +255,11 @@ gt_result_t gt_detect_ptrace(void) {
                 }
                 fclose(f);
             }
-            if (tp == gt_guard_pid()) exit(0);
+            if (tp == gt_guard_pid()) _exit(0);
             /* ptrace failed, likely already being traced */
-            exit(1);
+            _exit(1);
         }
-        exit(0);
+        _exit(0);
     } else if (child > 0) {
         /* Parent process */
         int status;

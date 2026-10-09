@@ -361,7 +361,10 @@ bool injected_check() {
         if (p5 + 1 < line.size()) path = line.substr(p5 + 1);
         // maps 行 inode 与 pathname 之间存在对齐空格 → 跳过前导空白
         size_t pb = path.find_first_not_of(" \t");
-        if (pb == std::string::npos) continue;
+        // 审查修复（B3）：path 为空（真匿名可执行映射）时 find_first_not_of 返回 npos，
+        // 原代码 continue 吞掉了——裸 mmap(PROT_EXEC) 注入永远不被判。正常环境唯一匿名
+        // 可执行段是 [vdso]（下方白名单），其余空 path 直接判注入。
+        if (pb == std::string::npos) return false;
         path = path.substr(pb);
 
         if (path.empty()) return false; // 真匿名可执行段 = 注入（正常环境不存在）
@@ -407,12 +410,24 @@ bool thread_spike_check() {
         ++count;
     }
     closedir(d);
+    // 审查修复（B9）：原实现启动瞬间（只有主线程 count=1）钉死基线 → 运行期稳态 12 线程
+    // 必超 1+阈值 → 默认配置必然误杀（文档"真机 10 分钟不崩"只能是当时设了 SEC_THRDBASE）。
+    // 改用"历史 max 渐进基线 + 连续 2 次超阈值"（与 maps_spike 同思路）：
+    //   - Vulkan/渲染线程渐进创建（每次 +1~2）→ hist_max 跟着爬升 → 不误杀；
+    //   - 注入线程突增（kxmwp 实测 +6~8 一次性出现）→ 连续 2 周期超阈值 → 命中。
+    static int hist_max = 0;
+    static int spike_hits = 0;
     if (g_cfg.thread_baseline < 0) {
-        g_cfg.thread_baseline = count; // 首个周期设基线
+        g_cfg.thread_baseline = count; // 首轮设基线（仅作参考，判据用 hist_max）
+        hist_max = count;
         return true;
     }
-    if (count > g_cfg.thread_baseline + g_cfg.thread_threshold)
-        return false; // 线程数突变 = 注入（agent 线程数躲不掉）
+    if (hist_max > 0 && count > hist_max + g_cfg.thread_threshold) {
+        if (++spike_hits >= 2) return false; // 连续 2 次超阈值 = 线程突增（注入）
+    } else {
+        spike_hits = 0;
+        if (count > hist_max) hist_max = count; // 渐进扩展：刷新历史 max
+    }
     return true;
 }
 
@@ -459,6 +474,8 @@ void start_guard_process() {
     if (pid == 0) {
         // ---- 守护进程（子）----
         close(g_guard_pipe[0]);
+        // 审查修复（N1/N6）：主进程被 kill → 守护自杀（PDEATHSIG）
+        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
         usleep(50000); // 等主进程 fork 返回并继续运行
         if (kill(main_pid, 0) == -1) _exit(0); // 主进程已死 → 退出
         // PTRACE_SEIZE：不注入 SIGSTOP（无 stop/CONT 竞态——实测 ATTACH 与主进程 fork/ptrace
@@ -468,10 +485,29 @@ void start_guard_process() {
         char ok = 1;
         ssize_t w = ::write(g_guard_pipe[1], &ok, 1); (void)w;
         close(g_guard_pipe[1]);
-        // 主循环：只监控主进程存活（守护无业务面，注入守护无意义）
+        // 事件循环替代 kill+usleep 轮询（审查修复 N1）：
+        //   - 被 trace 进程的每个信号都先产生 signal-delivery-stop，tracer 不 continue
+        //     信号就不会投递（kill -TERM 会永远卡住）→ 必须 waitpid + 转发；
+        //   - 主进程 fork 的子进程（继承 trace）也归本循环放行/收尸；
+        //   - 主进程 exit 事件同样在此收割。
         for (;;) {
-            if (kill(main_pid, 0) == -1) _exit(0); // 主进程死 → 守护退出
-            usleep(500000);
+            int st = 0;
+            pid_t r = waitpid(-1, &st, __WALL);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                _exit(0); // ECHILD 等：没有可 wait 的进程 → 主进程已死
+            }
+            if (r == main_pid && (WIFEXITED(st) || WIFSIGNALED(st)))
+                _exit(0); // 主进程退出 → 守护退出
+            if (WIFSTOPPED(st)) {
+                int sig = WSTOPSIG(st);
+                if (sig == SIGTRAP || sig == SIGSTOP || sig == SIGCONT || sig == SIGSEGV)
+                    sig = 0; // 内部/伪装事件不透传
+                ptrace(PTRACE_CONT, r, 0, sig); // 其余信号原样转发（含 SIGTERM/SIGINT）
+            } else if (WIFEXITED(st) || WIFSIGNALED(st)) {
+                // 继承 trace 的子进程退出 → 放行收尸（父进程可正常 wait）
+                ptrace(PTRACE_CONT, r, 0, 0);
+            }
         }
     }
     // ---- 主进程（父）----
@@ -482,32 +518,41 @@ void start_guard_process() {
     fcntl(g_guard_pipe[0], F_SETFL, fl | O_NONBLOCK);
 }
 
-// ---------- L1.29: maps 段数突变检测 ----------
-// 原理：注入必在 /proc/self/maps 新增映射段（agent 代码/数据/辅助段）。
-// 历史 max 基线：正常运行时新 mmap（渲染资源、线程栈）是"渐进扩展"，每次都会刷新 max → 不判；
-// 只有"历史 max 稳定后瞬时新增多段且持续"（注入特征）→ 连续 2 次超阈值 → 检出。
+// ---------- L1.29: maps 可执行段数突变检测 ----------
+// 原理：注入必在 /proc/self/maps 新增**可执行**映射段（agent 代码段——注入器的 payload 一定是 x）。
+// 历史 max 基线：正常运行新增映射（渲染资源、线程栈、Vulkan 管线缓冲）是**非执行数据段**，
+// 且渐进扩展（每次刷新 max）→ 不判；只有"历史 max 稳定后瞬时新增 >6 个可执行段且持续"
+// （注入特征——frida agent 一次性建 6+ 个 x 段）→ 连续 2 次超阈值 → 检出。
+// 审查修复（B2+B2回归）：① 原顺序导致第二条永不可达（L1.29 恒不触发）；② 修复后全段计数
+// 在 Vulkan 初始化（T3 通过后一次性建大量 rw 数据段）时误杀 → 改为**只统计可执行段**——
+// 注入必新增 x 段、Vulkan 建的是 rw 段（不参与计数），误杀面消除。
 AMICE_FLATTEN_H /*L2AMICE*/
 bool maps_spike_check() {
     if (!g_cfg.enable_mapwatch) return true;
     std::string data;
     if (!syscall_read_proc("/proc/self/maps", data)) return true; // 读不到放行（保守）
     size_t count = 0;
-    for (size_t i = 0; i < data.size(); ++i)
-        if (data[i] == '\n') ++count;
-    if (count < 5) return true; // 异常少的 maps 不值得判（防御性）
+    std::istringstream ms(data);
+    std::string line;
+    while (std::getline(ms, line)) {
+        size_t p1 = line.find(' ');
+        if (p1 == std::string::npos) continue;
+        size_t p2 = line.find(' ', p1 + 1);
+        if (p2 == std::string::npos) continue;
+        std::string perms = line.substr(p1 + 1, p2 - p1 - 1);
+        if (perms.find('x') == std::string::npos) continue; // 只数可执行段
+        ++count;
+    }
+    if (count < 3) return true; // 异常少的 maps 不值得判（防御性）
 
     static size_t hist_max = 0;
     static int spike_hits = 0;
-    if (count > hist_max) {
-        hist_max = count; // 渐进扩展：刷新基线，不判
-        spike_hits = 0;
-        return true;
-    }
-    if (hist_max > 0 && count > hist_max + 6) { // 阈值 +6（frida agent 通常新增 >6 段）
+    if (hist_max > 0 && count > hist_max + 6) { // 阈值 +6（frida agent 通常新增 >6 个 x 段）
         if (++spike_hits >= 2) return false;     // 连续 2 次超阈值 = 注入（防瞬时抖动）
     } else {
         spike_hits = 0;
     }
+    if (count > hist_max) hist_max = count; // 渐进扩展：刷新基线（不提前 return）
     return true;
 }
 
@@ -515,6 +560,10 @@ bool maps_spike_check() {
 // ptrace attach 后 /proc/self/status 的 TracerPid != 0（补充 GhostTrace 周期复检）
 AMICE_FLATTEN_H /*L2AMICE*/
 bool tracerpid_check() {
+    // 审查修复（B8/N3）：guard_poll() 必须在 enable_tracerpid 开关判断之前——
+    // 否则 SEC_TRACER=0 时守护死亡检测被短路（守护被 kill 后防线静默失效）。
+    if (g_cfg.enable_guard && g_guard_pid > 0)
+        guard_poll();
     if (!g_cfg.enable_tracerpid) return true;
     std::string data;
     if (!syscall_read_proc("/proc/self/status", data)) return true; // 读不到就放行（保守）
@@ -532,7 +581,6 @@ bool tracerpid_check() {
     // L1.28: 守护占位后 TracerPid 常态 = 守护 pid（非 0），须白名单；
     //        守护死（EOF）或 TracerPid 变 0/第三方 → 检出。
     if (g_cfg.enable_guard && g_guard_pid > 0) {
-        guard_poll();
         if (g_guard_state == 0) return false;                              // 守护已死
         if (g_guard_state == 1) return (tracer_pid == (int)g_guard_pid);   // 必须 == 守护
         // attach 中：放行（TracerPid 可能是 0=未attach，也可能是守护=已attach但pipe未到；
@@ -628,7 +676,10 @@ bool relro_check() {
         if (base == 0) return true;
 
         relro_start = base + (relro_vaddr & ~(uint64_t)0xfffULL);
-        relro_len = static_cast<size_t>(relro_memsz);
+        // 审查修复（B14）：PT_GNU_RELRO 末页若与可写 .data 同页，maps 该行带 w →
+        // 用原 memsz 会误判"RELRO 被解除"。relro_len 对齐上取整到完整覆盖页。
+        uint64_t relro_vaddr_end = (relro_vaddr + relro_memsz + 0xfffULL) & ~(uint64_t)0xfffULL;
+        relro_len = static_cast<size_t>(relro_vaddr_end - relro_vaddr);
         parsed = true;
     }
 
@@ -647,7 +698,11 @@ bool relro_check() {
         uintptr_t end = strtoull(line.substr(p0 + 1, p1 - p0 - 1).c_str(), nullptr, 16);
         // 只关心自身映射（RELRO 属于本程序）——地址重叠即可（maps 仅本进程，重叠必属自身）
         if (end <= relro_start || start >= relro_end) continue;
-        std::string perms = line.substr(p1 + 1, line.find(' ', p1 + 1) - p1 - 1);
+        // 审查修复（B14）：find 返回 npos 时 substr 长度会是巨大数（语义错）——显式截断
+        size_t pe = line.find(' ', p1 + 1);
+        std::string perms = (pe == std::string::npos)
+            ? line.substr(p1 + 1)
+            : line.substr(p1 + 1, pe - p1 - 1);
         if (perms.find('w') != std::string::npos)
             return false; // RELRO 只读段被解除为可写 = PLT hook 企图
     }
@@ -660,38 +715,47 @@ bool relro_check() {
 //     禁掉后 frida 只能 fallback tmpfile+dlopen → 非白名单可执行段 → injected_check 双保险。
 //   - process_vm_readv(270)/writev(271): 远程读写本进程内存（gdb/注入器常用）。
 //   - perf_event_open(241): 侧信道采样。
+//   - bpf(280): root 攻击者 eBPF/kprobe 挂探测路径。
+//   - open_by_handle_at(265): root 绕过路径限制打开任意文件句柄。
+//   - userfaultfd(282): 注入器常用（信号注入/内存同步）。
 // 注意：不禁 ptrace（GhostTrace 的 PTRACE_TRACEME 自占位 / PEEKDATA 反调试需要）。
+// 审查修复（B1）：号表必须用 __NR_*（此前 319/304/272 是 x86_64 号——arm64 的
+//   memfd_create=279、open_by_handle_at=265、272=kcmp；memfd 注入路径实际没关）。
 // 失败/未开启 → 放行（保守，不阻断启动）。
 void apply_seccomp_filter() {
 #ifdef __aarch64__
     if (!g_cfg.enable_seccomp) return;
+    // 编译期断言：arm64 号表与预期一致（防未来内核号表漂移）
+    static_assert(__NR_memfd_create == 279, "arm64 memfd_create != 279");
+    static_assert(__NR_process_vm_readv == 270, "arm64 process_vm_readv != 270");
+    static_assert(__NR_process_vm_writev == 271, "arm64 process_vm_writev != 271");
+    static_assert(__NR_perf_event_open == 241, "arm64 perf_event_open != 241");
+    static_assert(__NR_bpf == 280, "arm64 bpf != 280");
+    static_assert(__NR_open_by_handle_at == 265, "arm64 open_by_handle_at != 265");
+    static_assert(__NR_userfaultfd == 282, "arm64 userfaultfd != 282");
+#define SECCOMP_DENY(nr_) \
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (nr_), 0, 1), \
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA))
     struct sock_filter filter[] = {
         // 加载系统调用号
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-        // memfd_create
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 319, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
-        // process_vm_readv
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 270, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
-        // process_vm_writev
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 271, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
-        // perf_event_open
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 241, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
-        // L1.24v2: process_vm_writev(272)（对称禁 270/271；注入器/gdb 远程写本进程内存）
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 272, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
-        // L1.24v2: bpf(280)（root 攻击者 eBPF/kprobe 挂探测路径；程序自身不用）
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 280, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
-        // L1.24v2: open_by_handle_at(304)（root 绕过路径限制打开任意文件句柄）
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 304, 0, 1),
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        // memfd_create：frida agent 在本进程内建 memfd 可执行映射的路径
+        SECCOMP_DENY(__NR_memfd_create),
+        // process_vm_readv/writev：远程读写本进程内存（gdb/注入器常用）
+        SECCOMP_DENY(__NR_process_vm_readv),
+        SECCOMP_DENY(__NR_process_vm_writev),
+        // perf_event_open：侧信道采样
+        SECCOMP_DENY(__NR_perf_event_open),
+        // bpf：eBPF 挂探测路径
+        SECCOMP_DENY(__NR_bpf),
+        // open_by_handle_at：绕过路径限制
+        SECCOMP_DENY(__NR_open_by_handle_at),
+        // userfaultfd：注入器常用
+        SECCOMP_DENY(__NR_userfaultfd),
         // 其余放行
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
+#undef SECCOMP_DENY
     struct sock_fprog prog;
     prog.len = static_cast<unsigned short>(sizeof(filter) / sizeof(filter[0]));
     prog.filter = filter;
@@ -891,11 +955,20 @@ bool unicorn_check() {
     if (!g_cfg.enable_unicorn) return true;
 
     // ① CNTVCT_EL0 两次读取相等 → 假时钟（真实硬件不可能相等）
-    uint64_t t0 = 0, t1 = 0;
-    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t0));
-    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t1));
-    if (t0 == t1)
-        return false; // 计数器静止 = 模拟时钟
+    // 审查修复（B10）：背靠背两次读在低频系统计数器（19.2MHz/1MHz，周期 52ns~1µs）
+    // 上可能落在同一 tick 内 → 真机误杀。修正：读间隔内插入忙等（≥4µs，覆盖 1MHz
+    // 计数器一个 tick），且只判"连续 N 次背靠背后仍相等"。
+    bool clock_stalled = true;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        uint64_t t0 = 0, t1 = 0;
+        __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t0));
+        volatile uint64_t spin = 0;
+        for (int i = 0; i < 4096; ++i) spin += i; // 忙等 ~数 µs（-O3 下编译器不会消除副作用）
+        __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t1));
+        if (t0 != t1) { clock_stalled = false; break; }
+    }
+    if (clock_stalled)
+        return false; // 计数器静止 = 模拟时钟（3 次采样间隔 >1µs 仍相等）
 
     // ③ CTR_EL0 cache 特征寄存器：真机必非零（DminLine/IminLine 等字段指示 cache line 大小），
     //    Unicorn 2.1.4 实测返回 0 → 零值 = 模拟器未实现该寄存器（对新版 Unicorn 有效）
@@ -1022,6 +1095,10 @@ static uint64_t steady_ms() {
 }
 } // namespace
 
+// 审查修复（B11）：退出判定加盐存储——攻击者把 deadline 写 0 会得到盐值 ≠0 → 不免疫；
+// 加"退出线程"冗余路径——不依赖 should_exit（被 patch 也照样退）。
+static const uint64_t kExitSalt = 0x9e3779b97f4a7c15ULL;
+
 void arm_detected() {
     // 幂等：已武装不再重置（保证最终一定退出）
     if (g_exit_deadline_ms.load(std::memory_order_relaxed) != 0) return;
@@ -1030,15 +1107,24 @@ void arm_detected() {
     if (hi < lo) hi = lo;
     uint32_t delay_ms = static_cast<uint32_t>(lo) * 1000u +
                         (xorshift32() % (static_cast<uint32_t>(hi - lo + 1) * 1000u));
-    g_exit_deadline_ms.store(steady_ms() + delay_ms, std::memory_order_relaxed);
+    g_exit_deadline_ms.store((steady_ms() + delay_ms) ^ kExitSalt, std::memory_order_relaxed);
     freeze_detectors(); // L1.18: 武装后冻结检测函数页，防延迟窗口内被 patch 绕过
     poison_memory();    // L1.30: 命中投毒（诱饵区随机化，反 dump）
+    // 冗余退出路径：独立一次性线程 sleep 后 _exit(42)——should_exit 被 patch/主循环卡死也必退
+    uintptr_t sleep_ms = delay_ms;
+    pthread_t exit_thr;
+    if (pthread_create(&exit_thr, nullptr, [](void* p) -> void* {
+            usleep(static_cast<useconds_t>(reinterpret_cast<uintptr_t>(p)) * 1000u);
+            _exit(42);
+        }, reinterpret_cast<void*>(sleep_ms)) == 0) {
+        pthread_detach(exit_thr);
+    }
 }
 
 bool should_exit() {
     uint64_t d = g_exit_deadline_ms.load(std::memory_order_relaxed);
     if (d == 0) return false;
-    return steady_ms() >= d;
+    return steady_ms() >= (d ^ kExitSalt);
 }
 
 // ---------- L1.21: 检测线程心跳监控 ----------
@@ -1077,6 +1163,14 @@ void freeze_detectors() {
         reinterpret_cast<uintptr_t>(&tracerpid_check),
         reinterpret_cast<uintptr_t>(&rules_selfcheck),
         reinterpret_cast<uintptr_t>(&frida_extra_check),
+        // 审查修复（B11）："最终必退"判定函数也进冻结列表——攻击者 patch should_exit
+        // 头 4 字节 = 免疫延迟退出；arm 后这些页 RX 只读，patch 需先改页权限。
+        reinterpret_cast<uintptr_t>(&should_exit),
+        reinterpret_cast<uintptr_t>(&arm_detected),
+        reinterpret_cast<uintptr_t>(&maps_spike_check),
+        reinterpret_cast<uintptr_t>(&libc_hook_check),
+        reinterpret_cast<uintptr_t>(&unicorn_check),
+        reinterpret_cast<uintptr_t>(&relro_check),
     };
     uintptr_t last_page = 0;
     for (uintptr_t a : addrs) {

@@ -74,6 +74,9 @@ const char* gt_get_error_message(gt_result_t result) {
 
 /* Logging functionality */
 void gt_log(int level, const char *format, ...) {
+    /* 审查修复（B6）：stealth_mode 下彻底静默——否则命中瞬间 stderr 打印明文检测结论，
+       延迟退出的迷惑性被直接抹掉（攻击者挂 stderr 就知道哪条命中、几点命中）。 */
+    if (g_config.stealth_mode) return;
     if (!g_initialized && level > 0) {
         return; /* Only log errors if not initialized */
     }

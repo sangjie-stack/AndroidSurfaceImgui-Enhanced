@@ -26,6 +26,7 @@
 #ifndef A_NATIVE_WINDOW_CREATOR_H // !A_NATIVE_WINDOW_CREATOR_H
 #define A_NATIVE_WINDOW_CREATOR_H
 
+#include "amice_annotate.h"   //L2: amice 混淆注解
 #include <android/native_window.h>
 #include <android/log.h>
 #include <dlfcn.h>
@@ -687,6 +688,7 @@ namespace android {
                 Functionals::GetInstance().RefBase__IncStrong(data, this);
             }
 
+AMICE_FLATTEN_H /*L2AMICE*/
             SurfaceControl CreateSurface(const char *name, int32_t width, int32_t height, uint32_t windowFlags = 0, bool skipScrenshot = false) {
                 static void *parentHandle = nullptr;
                 parentHandle = nullptr;
@@ -1101,6 +1103,7 @@ namespace android {
             return local_displayInfo;
         }
 
+AMICE_FLATTEN_H /*L2AMICE*/
         static ANativeWindow *Create(const char *name, int32_t width = -1, int32_t height = -1, bool skipScrenshot_ = false) {
             std::lock_guard<std::recursive_mutex> stateLock(GetSurfaceStateMutex());
             auto &surfaceComposerClient = GetComposerInstance();

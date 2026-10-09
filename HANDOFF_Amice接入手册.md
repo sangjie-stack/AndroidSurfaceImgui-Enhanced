@@ -72,8 +72,10 @@
 **Amice（fuqiuluo/amice，Apache-2.0，v0.1.5-beta.5）是唯一同时满足「开源 + 现成 + 适配 Android 裸可执行文件 + 官方 NDK r30 bundle」的方案。**
 已否决：O-MVLL（Windows 交叉编译不支持、官方只测 r26d）、Kagura（需 Windows 自编插件）、Pluto（OLLVM14 工具链不匹配 r30）、UPX（Android 无法自解压）、XopProtector（APK 壳不适配裸 ELF）、ollvm-mingw（非 Android）。再往上只剩商业壳（爱加密/梆梆，非开源且 APK 级）。
 
-### 4.2 前置确认（唯一待用户回答的问题）
-**Ubuntu 虚拟机如何访问项目文件：SSH 可达（IP/端口/账号）？共享文件夹？还是拷贝 zip？** —— 此问题未得到用户答复，接手第一步先确认。
+### 4.2 前置确认（已解除 ✅ 2026-10-09）
+**Ubuntu 虚拟机访问方式 = SSH**：`~/.ssh/config` 别名 `wthh-vm` → `192.168.117.132:22`，用户 `wthh`，密钥 `~/.zcode/vm_wthh_key`（免密）。amice bundle 早已解压在 VM 的 `~/amice-lab/amice-android-ndk-r30-linux-x86_64`；本次新建工程副本 `~/amice-lab/proj-asimgui`。
+
+> **实际实施进度、构建证据、以及三个必须知道的坑（`-fexceptions` 让所有函数注解静默失效 / `AMICE_PASS_ORDER` 是允许列表且设计文档漏了 `VmVirtualize` / 拆静态库隔离异常被 ndk-build 的 feature 传播反杀），见 `L2_Amice实施记录.md` —— 接手 L2 请先读它。**
 
 ### 4.3 详细实施步骤（Ubuntu 侧）
 
