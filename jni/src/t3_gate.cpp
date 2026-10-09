@@ -66,6 +66,8 @@ namespace t3 {
 static uint64_t g_session_key   = 0;
 static bool     g_session_valid = false;
 static uint32_t g_decoded_tick  = 90;
+static uint64_t g_session_key_alt     = 0;   // core hex 解码形态的候选密钥
+static bool     g_session_key_alt_set = false;
 
 AMICE_FLATTEN_H /*L2AMICE*/
 bool verify_and_run() {
@@ -203,15 +205,42 @@ bool verify_and_run() {
 
     // —— 服务端密钥纠缠: 由真实登录才拿得到的 core 派生会话密钥 ——
     // 门禁被 patch 跳过时 g_session_valid 永远是 false (core 只有服务器会发)
-    g_session_key   = t3::derive_session_key(loginResult.core.c_str(),
-                                             (const char*)AY_OBFUSCATE("fa98f186f0ee325b653331c1fdb02e8f"));
-    g_session_valid = !loginResult.core.empty();
+    // T3 平台可能以 hex 编码下发 core: 同时派生 原文/hex解码 两个候选密钥,
+    // 解码时按序尝试 (entangle_or_die), 任一解开即通过
+    {
+        const char* appkey = (const char*)AY_OBFUSCATE("fa98f186f0ee325b653331c1fdb02e8f");
+        g_session_key = t3::derive_session_key(loginResult.core.c_str(), appkey);
+        // core 全为 hex 数字且偶数长度 => 尝试 hex 解码形态
+        const std::string& c = loginResult.core;
+        bool isHex = c.size() >= 2 && (c.size() % 2 == 0);
+        for (size_t i = 0; isHex && i < c.size(); ++i) {
+            char ch = c[i];
+            if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')))
+                isHex = false;
+        }
+        if (isHex) {
+            std::string decoded;
+            decoded.reserve(c.size() / 2);
+            for (size_t i = 0; i + 1 < c.size(); i += 2) {
+                auto nib = [](char ch) -> int {
+                    if (ch >= '0' && ch <= '9') return ch - '0';
+                    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+                    return ch - 'A' + 10;
+                };
+                decoded.push_back((char)((nib(c[i]) << 4) | nib(c[i + 1])));
+            }
+            if (!decoded.empty()) {
+                g_session_key_alt     = t3::derive_session_key(decoded.c_str(), appkey);
+                g_session_key_alt_set = true;
+            }
+        }
+        g_session_valid = !loginResult.core.empty();
+    }
 
     return true;
 }
 
 // —— 纠缠接口实现 ——————————————————————————————
-static const uint64_t kZeroKey = 0;
 
 bool session_key(uint64_t* out) {
     if (!g_session_valid) return false;
@@ -223,7 +252,13 @@ bool entangle_or_die() {
     uint64_t k = 0;
     if (!session_key(&k)) { t3::entangle_punish(); return false; }
     EntangledCfg cfg;
-    if (!entangle_decode(k, &cfg)) { t3::entangle_punish(); return false; }
+    // 候选1: core 原文派生; 候选2: core hex 解码形态派生(T3 平台可能 hex 下发)
+    if (!entangle_decode(k, &cfg)) {
+        if (!(g_session_key_alt_set && entangle_decode(g_session_key_alt, &cfg))) {
+            t3::entangle_punish();
+            return false;
+        }
+    }
     g_decoded_tick = cfg.security_tick ? cfg.security_tick : 90;
     return true;
 }
