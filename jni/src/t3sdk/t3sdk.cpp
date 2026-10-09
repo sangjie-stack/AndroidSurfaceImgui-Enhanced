@@ -3,6 +3,7 @@
  * 纯C++实现，不依赖OpenSSL
  */
 
+#include "amice_annotate.h"   //L2: amice 混淆注解
 #include "t3sdk.h"
 #include "obfuscate.h" /*L1: PEM定界符编译期加密*/
 #include <cstdio>
@@ -42,6 +43,21 @@
         #include <linux/if_packet.h>
     #endif
 #endif
+
+/* ---- L2: 异常自由化（amice VMP/Flatten 前置条件）----
+   C++ 异常关键字 try / catch / throw 会在 IR 里生成 invoke + landingpad，amice 明确拒绝这类函数。
+   本文件所有异常原本都在文件内被 catch，故改为"错误槽 + 显式检查"，语义等价。*/
+/* L2-FIX: 错误槽改为 thread_local。
+   原因: 心跳线程(heartbeatThread)与主线程都会调用 SDK, 普通 static 会被并发读写
+   (原 try/catch 版本每个函数各自持栈上异常对象, 无共享状态, 无此问题)。
+   同时新增 t3_clear_error(): 每个"可能置错的内部助手"入口先清空, 使错误槽永远只
+   反映"最近一次助手调用"的结果, 等价恢复原 try/catch 的函数级作用域隔离。*/
+static thread_local std::string g_t3_error;
+static inline void t3_raise(const char* msg) { g_t3_error = msg; }
+static inline bool t3_failed() { return !g_t3_error.empty(); }
+static inline void t3_clear_error() { g_t3_error.clear(); }
+static inline std::string t3_take_error() { std::string e = g_t3_error; g_t3_error.clear(); return e; }
+static inline std::string t3_take_error_or(const char* dflt) { std::string e = t3_take_error(); return e.empty() ? dflt : e; }
 
 /* ========== MD5算法实现 ========== */
 namespace {
@@ -94,6 +110,7 @@ static void md5Decode(uint32_t *out, const unsigned char *in, unsigned int len) 
         out[i]=((uint32_t)in[j])|(((uint32_t)in[j+1])<<8)|(((uint32_t)in[j+2])<<16)|(((uint32_t)in[j+3])<<24);
 }
 
+AMICE_FLATTEN_H /*L2AMICE*/
 static void md5Transform(uint32_t state[4], const unsigned char block[64]) {
     uint32_t a=state[0],b=state[1],c=state[2],d=state[3],x[16];
     md5Decode(x,block,64);
@@ -139,6 +156,7 @@ static void md5Init(MD5Context *ctx) {
     ctx->state[2]=0x98badcfe; ctx->state[3]=0x10325476;
 }
 
+AMICE_FLATTEN_H /*L2AMICE*/
 static void md5Update(MD5Context *ctx, const unsigned char *input, unsigned int len) {
     unsigned int i,idx,partLen;
     idx=(unsigned int)((ctx->count[0]>>3)&0x3F);
@@ -360,18 +378,27 @@ struct RSACrypto::RSAKey {
 RSACrypto::RSACrypto(const std::string& publicKeyPem) : key_(nullptr), keySize_(0) {
     key_ = new RSAKey();
     parsePEM(publicKeyPem);
+    if(t3_failed()){
+        /* L2: 解析失败(原为构造函数抛出→由 initRSA 的 catch 吞掉)。
+           置 0 值状态, 不留负数块长; 调用方检查错误槽后丢弃本对象。*/
+        encryptBlockSize_ = 0;
+        decryptBlockSize_ = 0;
+        return;
+    }
     encryptBlockSize_ = keySize_ - 11;
     decryptBlockSize_ = keySize_;
 }
 
 void RSACrypto::parsePEM(const std::string& pem) {
+    t3_clear_error();   /* L2-FIX: 助手入口清槽, 只反映本次解析结果 */
     /* 提取Base64内容 (PEM定界符编译期加密, 二进制无明文指纹) */
     static const char* PEM_HDR = (const char*)AY_OBFUSCATE("-----BEGIN PUBLIC KEY-----");
     static const char* PEM_TLR = (const char*)AY_OBFUSCATE("-----END PUBLIC KEY-----");
     auto s = pem.find(PEM_HDR);
     auto e = pem.find(PEM_TLR);
-    if(s==std::string::npos||e==std::string::npos)
-        throw std::runtime_error("Invalid PEM format");
+    if(s==std::string::npos||e==std::string::npos){
+        t3_raise("Invalid PEM format"); return;
+    }
     s += strlen(PEM_HDR);
     std::string b64;
     for(size_t i=s;i<e;i++){
@@ -381,7 +408,7 @@ void RSACrypto::parsePEM(const std::string& pem) {
     
     /* Base64解码为DER */
     std::vector<uint8_t> der = stdBase64Decode(b64);
-    if(der.empty()) throw std::runtime_error("PEM base64 decode failed");
+    if(der.empty()){ t3_raise("PEM base64 decode failed"); return; }
     
     /* ASN.1 DER 解析 */
     int off=0;
@@ -394,19 +421,19 @@ void RSACrypto::parsePEM(const std::string& pem) {
     };
     
     /* 外层SEQUENCE */
-    if(der[off]!=0x30) throw std::runtime_error("DER: expected SEQUENCE");
+    if(der[off]!=0x30){ t3_raise("DER: expected SEQUENCE"); return; }
     off++; readLen();
     /* AlgorithmIdentifier SEQUENCE */
-    if(der[off]!=0x30) throw std::runtime_error("DER: expected AlgorithmIdentifier");
+    if(der[off]!=0x30){ t3_raise("DER: expected AlgorithmIdentifier"); return; }
     off++; int alen=readLen(); off+=alen;
     /* BIT STRING */
-    if(der[off]!=0x03) throw std::runtime_error("DER: expected BIT STRING");
+    if(der[off]!=0x03){ t3_raise("DER: expected BIT STRING"); return; }
     off++; readLen(); off++; /* skip unused bits byte */
     /* 内层SEQUENCE */
-    if(der[off]!=0x30) throw std::runtime_error("DER: expected inner SEQUENCE");
+    if(der[off]!=0x30){ t3_raise("DER: expected inner SEQUENCE"); return; }
     off++; readLen();
     /* INTEGER n */
-    if(der[off]!=0x02) throw std::runtime_error("DER: expected INTEGER for n");
+    if(der[off]!=0x02){ t3_raise("DER: expected INTEGER for n"); return; }
     off++; int nlen=readLen();
     if(der[off]==0x00){off++;nlen--;}
     key_->n = BigNum::fromBE(der.data()+off, nlen);
@@ -414,11 +441,12 @@ void RSACrypto::parsePEM(const std::string& pem) {
     keySize_ = nlen;
     off+=nlen;
     /* INTEGER e */
-    if(der[off]!=0x02) throw std::runtime_error("DER: expected INTEGER for e");
+    if(der[off]!=0x02){ t3_raise("DER: expected INTEGER for e"); return; }
     off++; int elen=readLen();
     key_->e = BigNum::fromBE(der.data()+off, elen);
 }
 
+AMICE_FLATTEN_H /*L2AMICE*/
 std::vector<uint8_t> RSACrypto::encrypt(const std::string& data) const {
     std::vector<uint8_t> result;
     const uint8_t* msg = (const uint8_t*)data.c_str();
@@ -490,8 +518,14 @@ std::string RSACrypto::decryptFromBase64(const std::string& base64Str) const {
 const std::string CustomBase64::STANDARD_CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 CustomBase64::CustomBase64(const std::string& customCharset) : customCharset_(customCharset) {
-    if(customCharset.size()!=64)
-        throw std::invalid_argument("自定义字符集必须是64位字符");
+    t3_clear_error();   /* L2-FIX: 构造函数入口清槽, 只反映本次构造结果 */
+    if(customCharset.size()!=64){
+        /* L2: 原 throw std::invalid_argument —— 改为记录错误 + 安全默认状态:
+           回退到标准字符集, 保证 customCharset_[0..63] 始终可索引(不留越界读)。
+           错误文案逐字保留; 调用方(init)检查错误槽后返回 false。*/
+        t3_raise("自定义字符集必须是64位字符");
+        customCharset_ = STANDARD_CHARSET;
+    }
 }
 
 std::string CustomBase64::encode(const std::string& data) const {
@@ -587,6 +621,7 @@ std::string decodeJsonString(const std::string& in) {
     return out;
 }
 
+AMICE_FLATTEN_H /*L2AMICE*/
 bool jsonGetString(const std::string& json, const std::string& key, std::string& value) {
     std::string sk="\""+key+"\"";
     auto pos=json.find(sk);
@@ -792,6 +827,7 @@ std::string httpPostRaw(const std::string& url, const std::string& postData) {
 
 /* ========== 机器码获取 ========== */
 
+AMICE_FLATTEN_H /*L2AMICE*/
 std::string getMachineCode() {
     std::string macStr;
     
@@ -874,28 +910,43 @@ bool T3Verify::init(const std::string& loginCode, const std::string& noticeCode,
     loginCode_=loginCode; noticeCode_=noticeCode;
     versionCode_=versionCode; heartbeatCode_=heartbeatCode;
     appkey_=appkey; encodeType_=0;
-    try {
-        delete encoder_; encoder_=new CustomBase64(base64Charset);
-    } catch(...) { return false; }
+    delete encoder_; encoder_=new CustomBase64(base64Charset);
+    if(t3_failed()){
+        /* L2: 原 catch(...) 直接 return false (丢弃 e.what())。
+           取走错误槽, 避免残留错误污染后续 t3_failed() 检查; 语义等价。*/
+        delete encoder_; encoder_=nullptr;
+        t3_take_error();
+        return false;
+    }
     initialized_=true;
     return true;
 }
 
+AMICE_FLATTEN_H /*L2AMICE*/
 bool T3Verify::initRSA(const std::string& loginCode, const std::string& noticeCode,
                        const std::string& versionCode, const std::string& heartbeatCode,
                        const std::string& appkey, const std::string& rsaPublicKey) {
     loginCode_=loginCode; noticeCode_=noticeCode;
     versionCode_=versionCode; heartbeatCode_=heartbeatCode;
     appkey_=appkey; encodeType_=1;
-    try {
-        delete rsaCrypto_; rsaCrypto_=new RSACrypto(rsaPublicKey);
-    } catch(...) { return false; }
+    delete rsaCrypto_; rsaCrypto_=new RSACrypto(rsaPublicKey);
+    if(t3_failed()){
+        /* L2: 原 catch(...) 直接 return false (丢弃 e.what())。
+           取走错误槽; 并把半成品对象置空(原实现会留下悬垂指针), 语义等价。*/
+        delete rsaCrypto_; rsaCrypto_=nullptr;
+        t3_take_error();
+        return false;
+    }
     initialized_=true;
     return true;
 }
 
 void T3Verify::checkInit() const {
-    if(!initialized_) throw std::runtime_error("未初始化，请先调用 init() 或 initRSA()");
+    t3_clear_error();   /* L2-FIX(核心): 清掉【前面请求】残留的错误。
+                           login/simpleRequest 等的 checkInit()+t3_failed() 检查点
+                           现在只反映 initialized_ 本身, 不再被 getNotice/
+                           getLatestVersion 的局部失败污染。 */
+    if(!initialized_){ t3_raise("未初始化，请先调用 init() 或 initRSA()"); return; }
 }
 
 std::string T3Verify::buildUrl(const std::string& code) const {
@@ -908,6 +959,7 @@ std::string T3Verify::encodeValue(const std::string& value) const {
     else return rsaCrypto_->encryptToHex(value);
 }
 
+AMICE_FLATTEN_H /*L2AMICE*/
 std::string T3Verify::decodeResponse(const std::string& responseText) const {
     /* 清理响应 */
     std::string data=responseText;
@@ -923,6 +975,7 @@ std::string T3Verify::decodeResponse(const std::string& responseText) const {
     else return rsaCrypto_->decryptFromBase64(clean);
 }
 
+AMICE_FLATTEN_H /*L2AMICE*/
 std::pair<std::vector<std::pair<std::string,std::string>>,std::string>
 T3Verify::encodeParams(const std::vector<std::pair<std::string,std::string>>& params) const {
     /* 1. 每个值只编码一次，保持原始顺序 */
@@ -946,13 +999,14 @@ T3Verify::encodeParams(const std::vector<std::pair<std::string,std::string>>& pa
 
 std::string T3Verify::httpPost(const std::string& url,
                                const std::vector<std::pair<std::string,std::string>>& data) {
+    t3_clear_error();   /* L2-FIX: 助手入口清槽; 失败只由下方"所有服务器都失败"处 raise 一次 */
     std::string postData;
     for(auto& p:data){
         if(!postData.empty()) postData+="&";
         postData+=p.first+"="+p.second;
     }
     URLInfo original;
-    if(!parseUrl(url,original)) throw std::runtime_error("无效的URL");
+    if(!parseUrl(url,original)){ t3_raise("无效的URL"); return std::string(); }
     std::vector<std::string> candidates={serverUrl_};
     for(const auto& base:serverUrls_) if(base!=serverUrl_) candidates.push_back(base);
     for(const auto& base:candidates){
@@ -962,81 +1016,80 @@ std::string T3Verify::httpPost(const std::string& url,
         std::string response=httpPostRaw(target,postData);
         if(!response.empty()){ serverUrl_=base; return response; }
     }
-    throw std::runtime_error("无法连接到所有T3网络验证服务器，可能是因为您的网络问题或T3网络验证服务器被攻击造成的，建议检查网络或稍后重试");
+    t3_raise("无法连接到所有T3网络验证服务器，可能是因为您的网络问题或T3网络验证服务器被攻击造成的，建议检查网络或稍后重试");
+    return std::string();
 }
 
+AMICE_FLATTEN_H /*L2AMICE*/
 T3LoginResult T3Verify::login(const std::string& kami, const std::string& imei) {
     T3LoginResult result;
-    try {
-        checkInit();
-        std::string url=buildUrl(loginCode_);
-        time_t now=time(NULL);
-        std::string tStr=std::to_string((long)now);
-        
-        std::vector<std::pair<std::string,std::string>> params={
-            {"kami",kami},{"imei",imei},{"t",tStr}
-        };
-        auto [encoded, sOriginal]=encodeParams(params);
-        
-        std::string response=httpPost(url,encoded);
-        if(response.empty()){result.error="HTTP请求失败";return result;}
-        
-        std::string decoded;
-        try { decoded=decodeResponse(response); }
-        catch(...){result.error="响应解码失败";return result;}
-        
-        int code=0;
-        if(!jsonGetInt(decoded,"code",code)){result.error="响应不是有效的JSON格式";return result;}
-        if(code!=200){
-            std::string msg; jsonGetString(decoded,"msg",msg);
-            result.error=msg.empty()?"未知错误":msg; return result;
-        }
-        
-        std::string kamiId,endTime,token,statecode;
-        int responseTime=0;
-        if(!jsonGetString(decoded,"id",kamiId)||!jsonGetString(decoded,"end_time",endTime)||
-           !jsonGetString(decoded,"token",token)||!jsonGetString(decoded,"statecode",statecode)||
-           !jsonGetInt(decoded,"time",responseTime)){
-            result.error="响应数据缺少必要字段"; return result;
-        }
-        
-        int timeDiff=abs((int)now-responseTime);
-        if(timeDiff>5){
-            result.error="时间戳校验失败，相差"+std::to_string(timeDiff)+"秒"; return result;
-        }
-        
-        /* 生成预期token */
-        struct tm *tmInfo=localtime(&now);
-        char dateStr[16];
-        strftime(dateStr,sizeof(dateStr),"%Y%m%d%H%M",tmInfo);
-        std::string tokenSrc=kamiId+appkey_+sOriginal+endTime+dateStr;
-        std::string expectedToken=md5String(tokenSrc);
-        
-        /* token比较(忽略大小写) */
-        std::string tLower=token, eLower=expectedToken;
-        std::transform(tLower.begin(),tLower.end(),tLower.begin(),::tolower);
-        std::transform(eLower.begin(),eLower.end(),eLower.begin(),::tolower);
-        if(tLower!=eLower){result.error="token校验失败";return result;}
-        
-        statecode_=statecode; endTime_=endTime;
-        result.success=true; result.id=kamiId;
-        result.end_time=endTime; result.statecode=statecode;
-        jsonGetString(decoded, "recharge", result.recharge);
-        jsonGetString(decoded, "use_time", result.use_time);
-        jsonGetString(decoded, "available", result.available);
-        jsonGetString(decoded, "imei", result.imei);
-        jsonGetString(decoded, "change", result.change);
-        jsonGetString(decoded, "core", result.core);
-        jsonGetString(decoded, "amount", result.amount);
-    } catch(const std::exception& e) {
-        result.error=e.what();
+    checkInit();
+    if(t3_failed()){ result.error=t3_take_error(); return result; }
+    std::string url=buildUrl(loginCode_);
+    time_t now=time(NULL);
+    std::string tStr=std::to_string((long)now);
+
+    std::vector<std::pair<std::string,std::string>> params={
+        {"kami",kami},{"imei",imei},{"t",tStr}
+    };
+    auto [encoded, sOriginal]=encodeParams(params);
+
+    std::string response=httpPost(url,encoded);
+    if(response.empty()){ result.error=t3_take_error_or("HTTP请求失败"); return result; }
+
+    std::string decoded=decodeResponse(response);
+    if(t3_failed()){ result.error=t3_take_error_or("响应解码失败"); return result; }
+
+    int code=0;
+    if(!jsonGetInt(decoded,"code",code)){result.error="响应不是有效的JSON格式";return result;}
+    if(code!=200){
+        std::string msg; jsonGetString(decoded,"msg",msg);
+        result.error=msg.empty()?"未知错误":msg; return result;
     }
+
+    std::string kamiId,endTime,token,statecode;
+    int responseTime=0;
+    if(!jsonGetString(decoded,"id",kamiId)||!jsonGetString(decoded,"end_time",endTime)||
+       !jsonGetString(decoded,"token",token)||!jsonGetString(decoded,"statecode",statecode)||
+       !jsonGetInt(decoded,"time",responseTime)){
+        result.error="响应数据缺少必要字段"; return result;
+    }
+
+    int timeDiff=abs((int)now-responseTime);
+    if(timeDiff>5){
+        result.error="时间戳校验失败，相差"+std::to_string(timeDiff)+"秒"; return result;
+    }
+
+    /* 生成预期token */
+    struct tm *tmInfo=localtime(&now);
+    char dateStr[16];
+    strftime(dateStr,sizeof(dateStr),"%Y%m%d%H%M",tmInfo);
+    std::string tokenSrc=kamiId+appkey_+sOriginal+endTime+dateStr;
+    std::string expectedToken=md5String(tokenSrc);
+
+    /* token比较(忽略大小写) */
+    std::string tLower=token, eLower=expectedToken;
+    std::transform(tLower.begin(),tLower.end(),tLower.begin(),::tolower);
+    std::transform(eLower.begin(),eLower.end(),eLower.begin(),::tolower);
+    if(tLower!=eLower){result.error="token校验失败";return result;}
+
+    statecode_=statecode; endTime_=endTime;
+    result.success=true; result.id=kamiId;
+    result.end_time=endTime; result.statecode=statecode;
+    jsonGetString(decoded, "recharge", result.recharge);
+    jsonGetString(decoded, "use_time", result.use_time);
+    jsonGetString(decoded, "available", result.available);
+    jsonGetString(decoded, "imei", result.imei);
+    jsonGetString(decoded, "change", result.change);
+    jsonGetString(decoded, "core", result.core);
+    jsonGetString(decoded, "amount", result.amount);
     return result;
 }
 
 
 
 
+AMICE_FLATTEN_H /*L2AMICE*/
 T3Result T3Verify::heartbeat(const std::string& kami, const std::string& statecode) {
     return simpleRequest(heartbeatCode_, "单码心跳", {{"kami",kami},{"statecode",statecode}});
 }
@@ -1067,25 +1120,25 @@ void T3Verify::setCode(const std::string& field, const std::string& code) {
 
 /* ========== 通用简单请求 ========== */
 
+AMICE_FLATTEN_H /*L2AMICE*/
 T3Result T3Verify::simpleRequest(const std::string& code, const std::string& codeName,
                                   const std::vector<std::pair<std::string, std::string>>& params) {
     T3Result result;
-    try {
-        checkInit();
-        if (code.empty()) { result.error = "未设置 " + codeName + " 调用码"; return result; }
-        auto allParams = params;
-        allParams.push_back({"t", std::to_string((long)time(NULL))});
-        auto [encoded, _] = encodeParams(allParams);
-        std::string response = httpPost(buildUrl(code), encoded);
-        if (response.empty()) { result.error = "HTTP请求失败"; return result; }
-        std::string decoded;
-        try { decoded = decodeResponse(response); } catch (...) { result.error = "响应解码失败"; return result; }
-        int c = 0;
-        if (!jsonGetInt(decoded, "code", c)) { result.error = "响应不是有效的JSON格式"; return result; }
-        if (c != 200) { std::string msg; jsonGetString(decoded, "msg", msg); result.error = msg.empty() ? "未知错误" : msg; return result; }
-        std::string msg; jsonGetString(decoded, "msg", msg);
-        result.success = true; result.msg = msg;
-    } catch (const std::exception& e) { result.error = e.what(); }
+    checkInit();
+    if (t3_failed()) { result.error = t3_take_error(); return result; }
+    if (code.empty()) { result.error = "未设置 " + codeName + " 调用码"; return result; }
+    auto allParams = params;
+    allParams.push_back({"t", std::to_string((long)time(NULL))});
+    auto [encoded, _] = encodeParams(allParams);
+    std::string response = httpPost(buildUrl(code), encoded);
+    if (response.empty()) { result.error = t3_take_error_or("HTTP请求失败"); return result; }
+    std::string decoded = decodeResponse(response);
+    if (t3_failed()) { result.error = t3_take_error_or("响应解码失败"); return result; }
+    int c = 0;
+    if (!jsonGetInt(decoded, "code", c)) { result.error = "响应不是有效的JSON格式"; return result; }
+    if (c != 200) { std::string msg; jsonGetString(decoded, "msg", msg); result.error = msg.empty() ? "未知错误" : msg; return result; }
+    std::string msg; jsonGetString(decoded, "msg", msg);
+    result.success = true; result.msg = msg;
     return result;
 }
 
@@ -1093,28 +1146,27 @@ T3Result T3Verify::simpleRequest(const std::string& code, const std::string& cod
 
 T3QueryResult T3Verify::queryKami(const std::string& kami) {
     T3QueryResult result;
-    try {
-        checkInit();
-        if (queryCode_.empty()) { result.error = "未设置查询卡密调用码"; return result; }
-        auto [encoded, _] = encodeParams({{"kami", kami}, {"t", std::to_string((long)time(NULL))}});
-        std::string response = httpPost(buildUrl(queryCode_), encoded);
-        if (response.empty()) { result.error = "HTTP请求失败"; return result; }
-        std::string decoded;
-        try { decoded = decodeResponse(response); } catch (...) { result.error = "响应解码失败"; return result; }
-        int c = 0;
-        if (!jsonGetInt(decoded, "code", c)) { result.error = "响应不是有效的JSON格式"; return result; }
-        if (c != 200) { std::string msg; jsonGetString(decoded, "msg", msg); result.error = msg.empty() ? "未知错误" : msg; return result; }
-        result.success = true;
-        jsonGetString(decoded, "state", result.state);
-        jsonGetString(decoded, "use", result.use);
-        jsonGetString(decoded, "id", result.id);
-        jsonGetString(decoded, "use_time", result.use_time);
-        jsonGetString(decoded, "end_time", result.end_time);
-        jsonGetString(decoded, "line_time", result.line_time);
-        jsonGetString(decoded, "line", result.line);
-        jsonGetString(decoded, "amount", result.amount);
-        jsonGetString(decoded, "available", result.available);
-    } catch (const std::exception& e) { result.error = e.what(); }
+    checkInit();
+    if (t3_failed()) { result.error = t3_take_error(); return result; }
+    if (queryCode_.empty()) { result.error = "未设置查询卡密调用码"; return result; }
+    auto [encoded, _] = encodeParams({{"kami", kami}, {"t", std::to_string((long)time(NULL))}});
+    std::string response = httpPost(buildUrl(queryCode_), encoded);
+    if (response.empty()) { result.error = t3_take_error_or("HTTP请求失败"); return result; }
+    std::string decoded = decodeResponse(response);
+    if (t3_failed()) { result.error = t3_take_error_or("响应解码失败"); return result; }
+    int c = 0;
+    if (!jsonGetInt(decoded, "code", c)) { result.error = "响应不是有效的JSON格式"; return result; }
+    if (c != 200) { std::string msg; jsonGetString(decoded, "msg", msg); result.error = msg.empty() ? "未知错误" : msg; return result; }
+    result.success = true;
+    jsonGetString(decoded, "state", result.state);
+    jsonGetString(decoded, "use", result.use);
+    jsonGetString(decoded, "id", result.id);
+    jsonGetString(decoded, "use_time", result.use_time);
+    jsonGetString(decoded, "end_time", result.end_time);
+    jsonGetString(decoded, "line_time", result.line_time);
+    jsonGetString(decoded, "line", result.line);
+    jsonGetString(decoded, "amount", result.amount);
+    jsonGetString(decoded, "available", result.available);
     return result;
 }
 
@@ -1138,30 +1190,29 @@ T3VersionResult T3Verify::getLatestVersion() {
 
 T3UpdateResult T3Verify::checkUpdate(const std::string& ver) {
     T3UpdateResult result;
-    try {
-        checkInit();
-        if (checkUpdateCode_.empty()) { result.error = "未设置检查更新调用码"; return result; }
-        auto [encoded, _] = encodeParams({{"ver", ver}, {"t", std::to_string((long)time(NULL))}});
-        std::string response = httpPost(buildUrl(checkUpdateCode_), encoded);
-        if (response.empty()) { result.error = "HTTP请求失败"; return result; }
-        std::string decoded;
-        try { decoded = decodeResponse(response); } catch (...) { result.error = "响应解码失败"; return result; }
-        int c = 0;
-        if (!jsonGetInt(decoded, "code", c)) { result.error = "响应不是有效的JSON格式"; return result; }
-        if (c == 200) {
-            result.success = true; result.hasUpdate = true;
-            jsonGetString(decoded, "ver", result.ver);
-            jsonGetString(decoded, "version", result.version);
-            jsonGetString(decoded, "uplog", result.uplog);
-            jsonGetString(decoded, "upurl", result.upurl);
-        } else if (c == 201) {
-            result.success = true; result.hasUpdate = false;
-            jsonGetString(decoded, "msg", result.msg);
-        } else {
-            std::string msg; jsonGetString(decoded, "msg", msg);
-            result.error = msg.empty() ? "未知错误" : msg;
-        }
-    } catch (const std::exception& e) { result.error = e.what(); }
+    checkInit();
+    if (t3_failed()) { result.error = t3_take_error(); return result; }
+    if (checkUpdateCode_.empty()) { result.error = "未设置检查更新调用码"; return result; }
+    auto [encoded, _] = encodeParams({{"ver", ver}, {"t", std::to_string((long)time(NULL))}});
+    std::string response = httpPost(buildUrl(checkUpdateCode_), encoded);
+    if (response.empty()) { result.error = t3_take_error_or("HTTP请求失败"); return result; }
+    std::string decoded = decodeResponse(response);
+    if (t3_failed()) { result.error = t3_take_error_or("响应解码失败"); return result; }
+    int c = 0;
+    if (!jsonGetInt(decoded, "code", c)) { result.error = "响应不是有效的JSON格式"; return result; }
+    if (c == 200) {
+        result.success = true; result.hasUpdate = true;
+        jsonGetString(decoded, "ver", result.ver);
+        jsonGetString(decoded, "version", result.version);
+        jsonGetString(decoded, "uplog", result.uplog);
+        jsonGetString(decoded, "upurl", result.upurl);
+    } else if (c == 201) {
+        result.success = true; result.hasUpdate = false;
+        jsonGetString(decoded, "msg", result.msg);
+    } else {
+        std::string msg; jsonGetString(decoded, "msg", msg);
+        result.error = msg.empty() ? "未知错误" : msg;
+    }
     return result;
 }
 
@@ -1175,22 +1226,21 @@ T3CloudDocResult T3Verify::getCloudDoc(const std::string& token) {
 
 T3AppSignResult T3Verify::appSign(const std::string& autograph) {
     T3AppSignResult result;
-    try {
-        checkInit();
-        if (appSignCode_.empty()) { result.error = "未设置应用签名调用码"; return result; }
-        auto [encoded, _] = encodeParams({{"autograph", autograph}, {"t", std::to_string((long)time(NULL))}});
-        std::string response = httpPost(buildUrl(appSignCode_), encoded);
-        if (response.empty()) { result.error = "HTTP请求失败"; return result; }
-        std::string decoded;
-        try { decoded = decodeResponse(response); } catch (...) { result.error = "响应解码失败"; return result; }
-        int c = 0;
-        if (!jsonGetInt(decoded, "code", c)) { result.error = "响应不是有效的JSON格式"; return result; }
-        if (c != 200) { std::string msg; jsonGetString(decoded, "msg", msg); result.error = msg.empty() ? "未知错误" : msg; return result; }
-        result.success = true;
-        jsonGetString(decoded, "msg", result.msg);
-        jsonGetString(decoded, "autograph", result.autograph);
-        int t = 0; jsonGetInt(decoded, "time", t); result.time = t;
-    } catch (const std::exception& e) { result.error = e.what(); }
+    checkInit();
+    if (t3_failed()) { result.error = t3_take_error(); return result; }
+    if (appSignCode_.empty()) { result.error = "未设置应用签名调用码"; return result; }
+    auto [encoded, _] = encodeParams({{"autograph", autograph}, {"t", std::to_string((long)time(NULL))}});
+    std::string response = httpPost(buildUrl(appSignCode_), encoded);
+    if (response.empty()) { result.error = t3_take_error_or("HTTP请求失败"); return result; }
+    std::string decoded = decodeResponse(response);
+    if (t3_failed()) { result.error = t3_take_error_or("响应解码失败"); return result; }
+    int c = 0;
+    if (!jsonGetInt(decoded, "code", c)) { result.error = "响应不是有效的JSON格式"; return result; }
+    if (c != 200) { std::string msg; jsonGetString(decoded, "msg", msg); result.error = msg.empty() ? "未知错误" : msg; return result; }
+    result.success = true;
+    jsonGetString(decoded, "msg", result.msg);
+    jsonGetString(decoded, "autograph", result.autograph);
+    int t = 0; jsonGetInt(decoded, "time", t); result.time = t;
     return result;
 }
 
@@ -1204,29 +1254,28 @@ T3Result T3Verify::userRegister(const std::string& user, const std::string& pass
 
 T3LoginResult T3Verify::userLogin(const std::string& user, const std::string& pass, const std::string& imei) {
     T3LoginResult result;
-    try {
-        checkInit();
-        if (userLoginCode_.empty()) { result.error = "未设置用户登录调用码"; return result; }
-        auto [encoded, _] = encodeParams({{"user", user}, {"pass", pass}, {"imei", imei}, {"t", std::to_string((long)time(NULL))}});
-        std::string response = httpPost(buildUrl(userLoginCode_), encoded);
-        if (response.empty()) { result.error = "HTTP请求失败"; return result; }
-        std::string decoded;
-        try { decoded = decodeResponse(response); } catch (...) { result.error = "响应解码失败"; return result; }
-        int c = 0;
-        if (!jsonGetInt(decoded, "code", c)) { result.error = "响应不是有效的JSON格式"; return result; }
-        if (c != 200) { std::string msg; jsonGetString(decoded, "msg", msg); result.error = msg.empty() ? "未知错误" : msg; return result; }
-        result.success = true;
-        jsonGetString(decoded, "id", result.id);
-        jsonGetString(decoded, "end_time", result.end_time);
-        jsonGetString(decoded, "statecode", result.statecode);
-        jsonGetString(decoded, "recharge", result.recharge);
-        jsonGetString(decoded, "use_time", result.use_time);
-        jsonGetString(decoded, "available", result.available);
-        jsonGetString(decoded, "imei", result.imei);
-        jsonGetString(decoded, "change", result.change);
-        jsonGetString(decoded, "core", result.core);
-        statecode_ = result.statecode; endTime_ = result.end_time;
-    } catch (const std::exception& e) { result.error = e.what(); }
+    checkInit();
+    if (t3_failed()) { result.error = t3_take_error(); return result; }
+    if (userLoginCode_.empty()) { result.error = "未设置用户登录调用码"; return result; }
+    auto [encoded, _] = encodeParams({{"user", user}, {"pass", pass}, {"imei", imei}, {"t", std::to_string((long)time(NULL))}});
+    std::string response = httpPost(buildUrl(userLoginCode_), encoded);
+    if (response.empty()) { result.error = t3_take_error_or("HTTP请求失败"); return result; }
+    std::string decoded = decodeResponse(response);
+    if (t3_failed()) { result.error = t3_take_error_or("响应解码失败"); return result; }
+    int c = 0;
+    if (!jsonGetInt(decoded, "code", c)) { result.error = "响应不是有效的JSON格式"; return result; }
+    if (c != 200) { std::string msg; jsonGetString(decoded, "msg", msg); result.error = msg.empty() ? "未知错误" : msg; return result; }
+    result.success = true;
+    jsonGetString(decoded, "id", result.id);
+    jsonGetString(decoded, "end_time", result.end_time);
+    jsonGetString(decoded, "statecode", result.statecode);
+    jsonGetString(decoded, "recharge", result.recharge);
+    jsonGetString(decoded, "use_time", result.use_time);
+    jsonGetString(decoded, "available", result.available);
+    jsonGetString(decoded, "imei", result.imei);
+    jsonGetString(decoded, "change", result.change);
+    jsonGetString(decoded, "core", result.core);
+    statecode_ = result.statecode; endTime_ = result.end_time;
     return result;
 }
 
@@ -1236,29 +1285,28 @@ T3Result T3Verify::userHeartbeat(const std::string& user, const std::string& pas
 
 T3LoginResult T3Verify::qqLogin(const std::string& openid, const std::string& accessToken) {
     T3LoginResult result;
-    try {
-        checkInit();
-        if (qqLoginCode_.empty()) { result.error = "未设置QQ登录调用码"; return result; }
-        auto [encoded, _] = encodeParams({{"openid", openid}, {"access_token", accessToken}, {"t", std::to_string((long)time(NULL))}});
-        std::string response = httpPost(buildUrl(qqLoginCode_), encoded);
-        if (response.empty()) { result.error = "HTTP请求失败"; return result; }
-        std::string decoded;
-        try { decoded = decodeResponse(response); } catch (...) { result.error = "响应解码失败"; return result; }
-        int c = 0;
-        if (!jsonGetInt(decoded, "code", c)) { result.error = "响应不是有效的JSON格式"; return result; }
-        if (c != 200) { std::string msg; jsonGetString(decoded, "msg", msg); result.error = msg.empty() ? "未知错误" : msg; return result; }
-        result.success = true;
-        jsonGetString(decoded, "id", result.id);
-        jsonGetString(decoded, "end_time", result.end_time);
-        jsonGetString(decoded, "statecode", result.statecode);
-        jsonGetString(decoded, "recharge", result.recharge);
-        jsonGetString(decoded, "use_time", result.use_time);
-        jsonGetString(decoded, "available", result.available);
-        jsonGetString(decoded, "imei", result.imei);
-        jsonGetString(decoded, "change", result.change);
-        jsonGetString(decoded, "core", result.core);
-        statecode_ = result.statecode; endTime_ = result.end_time;
-    } catch (const std::exception& e) { result.error = e.what(); }
+    checkInit();
+    if (t3_failed()) { result.error = t3_take_error(); return result; }
+    if (qqLoginCode_.empty()) { result.error = "未设置QQ登录调用码"; return result; }
+    auto [encoded, _] = encodeParams({{"openid", openid}, {"access_token", accessToken}, {"t", std::to_string((long)time(NULL))}});
+    std::string response = httpPost(buildUrl(qqLoginCode_), encoded);
+    if (response.empty()) { result.error = t3_take_error_or("HTTP请求失败"); return result; }
+    std::string decoded = decodeResponse(response);
+    if (t3_failed()) { result.error = t3_take_error_or("响应解码失败"); return result; }
+    int c = 0;
+    if (!jsonGetInt(decoded, "code", c)) { result.error = "响应不是有效的JSON格式"; return result; }
+    if (c != 200) { std::string msg; jsonGetString(decoded, "msg", msg); result.error = msg.empty() ? "未知错误" : msg; return result; }
+    result.success = true;
+    jsonGetString(decoded, "id", result.id);
+    jsonGetString(decoded, "end_time", result.end_time);
+    jsonGetString(decoded, "statecode", result.statecode);
+    jsonGetString(decoded, "recharge", result.recharge);
+    jsonGetString(decoded, "use_time", result.use_time);
+    jsonGetString(decoded, "available", result.available);
+    jsonGetString(decoded, "imei", result.imei);
+    jsonGetString(decoded, "change", result.change);
+    jsonGetString(decoded, "core", result.core);
+    statecode_ = result.statecode; endTime_ = result.end_time;
     return result;
 }
 
