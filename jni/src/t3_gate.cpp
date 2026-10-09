@@ -1,6 +1,7 @@
 // T3卡密验证门禁实现 —— 官方示例流程的加密落地
 // 阻塞: 版本检查 -> 公告 -> 本地卡密自动登录 -> 终端手动输入循环
 // 成功后: 保存卡密 + 启动60秒心跳线程(连续5次失败exit(1)) -> 返回true
+#include "amice_annotate.h"   //L2: amice 混淆注解
 #include "t3_gate.h"
 #include "t3sdk/t3sdk.h"
 #include "obfuscate.h"
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <limits.h>
+#include <memory>
 
 // 本地程序版本号
 static const char* LOCAL_VERSION = "1000";
@@ -56,15 +58,17 @@ static std::string trim_card(std::string card) {
 
 namespace t3 {
 
+AMICE_FLATTEN_H /*L2AMICE*/
 bool verify_and_run() {
-    T3Verify verify;
+    // verify 必须是 shared_ptr 堆对象: 心跳线程(detach)引用它, 函数返回后由引用计数保活, 避免悬垂引用
+    auto verify = std::make_shared<T3Verify>();
 
     std::cout << "========================================" << std::endl;
     std::cout << "            卡密验证系统" << std::endl;
     std::cout << "========================================" << std::endl << std::endl;
 
     // RSA模式初始化: 调用码/APPKEY/公钥全部编译期加密, 二进制无明文
-    if (!verify.initRSA(
+    if (!verify->initRSA(
         (const char*)AY_OBFUSCATE("76478CC2AC33CB6A"),                          /* 单码登录调用码 */
         (const char*)AY_OBFUSCATE("D13B45357DEAFAB3"),                          /* 获取程序公告调用码 */
         (const char*)AY_OBFUSCATE("3B403E6EC9CA0973"),                          /* 获取程序最新版本号调用码 */
@@ -83,7 +87,7 @@ bool verify_and_run() {
 
     // 1. 版本检查: 服务器版本高于本地则拒绝运行
     std::cout << "[版本检查] ";
-    auto versionResult = verify.getLatestVersion();
+    auto versionResult = verify->getLatestVersion();
     if (versionResult.success) {
         if (versionResult.version > LOCAL_VERSION) {
             std::cout << "发现新版本: " << versionResult.version
@@ -98,7 +102,7 @@ bool verify_and_run() {
 
     // 2. 公告
     std::cout << std::endl;
-    auto noticeResult = verify.getNotice();
+    auto noticeResult = verify->getNotice();
     if (noticeResult.success && !noticeResult.notice.empty()) {
         std::cout << "========== 公告 ==========" << std::endl;
         std::cout << noticeResult.notice << std::endl;
@@ -115,7 +119,7 @@ bool verify_and_run() {
     card = load_card();
     if (!card.empty()) {
         std::cout << "[自动登录] 检测到本地保存的卡密, 正在自动登录..." << std::endl;
-        loginResult = verify.login(card, machineCode);
+        loginResult = verify->login(card, machineCode);
         if (loginResult.success) {
             loggedIn = true;
             std::cout << "[自动登录] 登录成功!" << std::endl;
@@ -137,7 +141,7 @@ bool verify_and_run() {
         }
 
         std::cout << "[登录中] 正在验证卡密..." << std::endl;
-        loginResult = verify.login(card, machineCode);
+        loginResult = verify->login(card, machineCode);
         if (loginResult.success) {
             loggedIn = true;
             std::cout << "[登录成功]" << std::endl;
@@ -161,14 +165,18 @@ bool verify_and_run() {
     save_card(card);
 
     // 5. 心跳线程: 每60秒一次, 连续失败5次强制退出
-    std::thread heartbeatThread([&]() {
+    // 必须值捕获(verify shared_ptr 保活 + card/statecode 值拷贝): 原 [&] 引用捕获悬垂, 60秒后首次心跳
+    // 访问已销毁栈对象 → string 读垃圾长度 → std::bad_alloc 崩溃(真机两次复现)
+    std::string hbCard = card;
+    std::string hbStatecode = loginResult.statecode;
+    std::thread heartbeatThread([verify, hbCard, hbStatecode]() {
         int failCount = 0;
         const int MAX_FAIL = 5;
         const int INTERVAL = 60;
 
         while (true) {
             std::this_thread::sleep_for(std::chrono::seconds(INTERVAL));
-            auto hbResult = verify.heartbeat(card, loginResult.statecode);
+            auto hbResult = verify->heartbeat(hbCard, hbStatecode);
             if (hbResult.success) {
                 failCount = 0;
             } else {
