@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <memory>
 
@@ -61,18 +62,47 @@ static std::string trim_card(std::string card) {
 namespace t3 {
 
 // —— 纠缠状态(仅真实登录路径写入) ——
+// 第五轮(内核内存扫描对冲): 会话密钥/解码配置/特征常量不落明文 .bss——
+// g_mask 为进程启动时随机掩码(每进程不同), 存储态一律 XOR 掩码, 读取瞬间还原。
+// 内核全内存扫描找 0x5A17C0DE/合法 tick 值/密钥熵特征 → 命中的全是掩码态垃圾。
+// 天花板: 攻击者 hwbp 断还原点仍可拿瞬时明文(由 slowdown_check+双路径对冲成本)。
 
-static uint64_t g_session_key   = 0;   // core 原文派生的候选密钥
-static bool     g_session_valid = false;
-static uint32_t g_decoded_tick  = 90;
-static uint64_t g_session_key_alt     = 0;   // core hex 解码形态的候选密钥
+static uint64_t g_mask = [] {
+    uint64_t m = 0;
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) { read(fd, &m, sizeof(m)); close(fd); }
+    return m ^ static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&m)) ^ 0x9E3779B97F4A7C15ull;
+}();
+
+static uint64_t g_session_key   = 0;   // 掩码态: core 原文派生候选
+static uint64_t g_session_key_alt     = 0;   // 掩码态: core hex 解码形态候选
+static bool     g_session_valid = false;     // 是否发生过真实登录(core 非空)
 static bool     g_session_key_alt_set = false;
-static EntangledCfg g_cfg = {};   // v2: 解码后配置(消费端: 检测节奏/随机源)
-static uint64_t g_win_key = 0;    // 实际解开 ENC_CFG 的候选(主或 alt)
+static uint32_t g_decoded_tick  = 90;        // 由掩码态 g_cfg 解出(非机密, 明文可)
+static EntangledCfg g_cfg = {};   // 掩码态: 解码后配置
+static uint64_t g_win_key = 0;    // 掩码态: 实际解开 ENC_CFG 的候选(主或 alt)
 static bool     g_win_set = false;
-// v2.5: 业务特征常量(--blob 生成时启用); 静态缓冲, 仅解码成功路径填充
+// v2.5: 业务特征常量; 掩码态(整个缓冲与 g_mask 同掩码)
 static uint8_t  g_features_buf[ENC_FEATURES_LEN > 0 ? ENC_FEATURES_LEN : 1] = {};
 static uint32_t g_features_len = 0;
+
+// 掩码存取原语(读时还原): 编译器难以跨优化保持明文驻留, 且读写点集中可审计
+static inline uint64_t unmask_key(uint64_t v) { return v ^ g_mask; }
+static inline void     write_masked_key(uint64_t* slot, uint64_t plain) { *slot = plain ^ g_mask; }
+static inline void     unmask_cfg(EntangledCfg* c) {
+    uint64_t* p = reinterpret_cast<uint64_t*>(c);
+    p[0] ^= g_mask; p[1] ^= g_mask;
+}
+static inline void     write_masked_cfg(EntangledCfg* slot, const EntangledCfg& c) {
+    uint64_t* p = reinterpret_cast<uint64_t*>(slot);
+    const uint64_t* q = reinterpret_cast<const uint64_t*>(&c);
+    p[0] = q[0] ^ g_mask; p[1] = q[1] ^ g_mask;
+}
+
+// 蜜罐假密钥(第五轮): 静态部署两个"看起来像会话密钥"的陷阱——内核扫描者/暴力
+// 猜测者拿假钥跑解密 → 结果必然是垃圾 → 无害; 但若攻击者 patch 判定逻辑让假钥
+// "通过", 后续双路径比对 mismatch → 武装延迟退出(见 entangle_or_die)。
+static const uint64_t kHoneypotKeys[2] = { 0x5A17C0DE5A17C0DEull, 0xDEADC0DEDEADC0DEull };
 
 // core 是否全为 hex 数字且偶数长度(T3 平台可能以 hex 编码下发 core)
 // VMP 注解: 纯标量小循环, 符合 VMP 画像
@@ -298,8 +328,10 @@ bool verify_and_run() {
         // 悬垂 UB(碰巧踩残留栈字节"能用"); 明文窗口也因此在使用中就被清零
         auto appkey = AY_OBFUSCATE("fa98f186f0ee325b653331c1fdb02e8f");
         bool has_alt = false;
-        derive_core_candidates(loginResult.core, (const char*)appkey,
-                               g_session_key, g_session_key_alt, has_alt);
+        uint64_t k0 = 0, k1 = 0;
+        derive_core_candidates(loginResult.core, (const char*)appkey, k0, k1, has_alt);
+        write_masked_key(&g_session_key, k0);          // 第五轮: 掩码态落盘
+        write_masked_key(&g_session_key_alt, k1);
         g_session_key_alt_set = has_alt;
         g_session_valid = !loginResult.core.empty();
     }
@@ -314,36 +346,59 @@ bool verify_and_run() {
 AMICE_FLATTEN_H /*L2AMICE*/
 bool session_key(uint64_t* out) {
     if (!g_win_set) return false;
-    if (out) *out = g_win_key;
+    if (out) *out = unmask_key(g_win_key);   // 读时还原, 明文只在寄存器
     return true;
 }
 
 // v2(审计 P0-1/P2①): 解码失败不再返回 false——武装延迟退出并返回 true 伪装
 // 通过, 垃圾配置流入消费端(检测节奏/随机源)使行为悄悄劣化, 20~90s 后由主循环
 // should_exit() 统一静默退出。不给"改这里就过了"的即时反馈。
+// 第五轮(双路径冗余, 对冲内核 hwbp 改一路): win 密钥走两条独立计算路径——
+// ①直接用 win 解 ENC_CFG; ②用 unmask_key(write_masked_key 回读的 win) 再解一次。
+// hwbp 一次性篡改任一路径的中间值 → 两路结果失配 → 武装延迟退出。
+// 蜜罐: 假密钥若被 patch 进判定, 两路同样失配。
 AMICE_FLATTEN_H /*L2AMICE*/
 bool entangle_or_die() {
     EntangledCfg cfg;
     uint64_t win = 0;
     bool ok = false;
-    if (g_session_valid && t3::entangle_decode(g_session_key, &cfg)) {
-        win = g_session_key; ok = true;
-    } else if (g_session_key_alt_set && t3::entangle_decode(g_session_key_alt, &cfg)) {
-        win = g_session_key_alt; ok = true;
+    if (g_session_valid && t3::entangle_decode(unmask_key(g_session_key), &cfg)) {
+        win = unmask_key(g_session_key); ok = true;
+    } else if (g_session_key_alt_set && t3::entangle_decode(unmask_key(g_session_key_alt), &cfg)) {
+        win = unmask_key(g_session_key_alt); ok = true;
     }
     if (!ok) {
         entangle_punish();
         return true;   // 伪装通过; 延迟退出已武装
     }
-    g_win_key = win;
+    // 蜜罐触发: 判定被 patch 成让假密钥"通过" → 立即武装延迟退出
+    for (int i = 0; i < 2; ++i)
+        if (win == kHoneypotKeys[i]) { entangle_punish(); return true; }
+    // 双路径冗余: 路径②把 win 掩码写入再读出, 走独立存储往返
+    uint64_t win_roundtrip = 0;
+    write_masked_key(&win_roundtrip, win);
+    win_roundtrip = unmask_key(win_roundtrip);
+    EntangledCfg cfg2;
+    if (win_roundtrip != win ||
+        !t3::entangle_decode(win_roundtrip, &cfg2) ||
+        __builtin_memcmp(&cfg, &cfg2, sizeof(cfg)) != 0) {
+        // 一致性失配 = 内存被内核 hwbp/写干预篡改 → 武装延迟退出, 伪装照常
+        entangle_punish();
+        return true;
+    }
+    write_masked_key(&g_win_key, win);
     g_win_set = true;
-    g_cfg = cfg;
+    write_masked_cfg(&g_cfg, cfg);
     g_decoded_tick = cfg.security_tick ? cfg.security_tick : 90;
-    // v2.5: 同一条密钥流接续解密业务特征常量(未用 --blob 时为空, 静默跳过)
+    // v2.5: 同一条密钥流接续解密业务特征常量(未用 --blob 时为空, 静默跳过);
+    // 特征缓冲落盘前整体 XOR 掩码, 消费端 entangled_features() 读时还原
     g_features_len = 0;
     if (ENC_FEATURES_LEN > 0 &&
-        t3::entangle_decode_features(win, g_features_buf, ENC_FEATURES_LEN))
+        t3::entangle_decode_features(win, g_features_buf, ENC_FEATURES_LEN)) {
+        for (uint32_t i = 0; i < ENC_FEATURES_LEN; ++i)
+            g_features_buf[i] ^= static_cast<uint8_t>(g_mask >> ((i & 7) * 8));
         g_features_len = ENC_FEATURES_LEN;
+    }
     return true;
 }
 
@@ -352,18 +407,37 @@ uint32_t entangled_security_tick() { return g_decoded_tick; }
 
 // v2.5(预留): 解密后的业务特征常量(偏移/参数)。仅 entangle_or_die() 用真实
 // core 解码成功后有效; patch 门禁 => 垃圾偏移 => 功能静默失效(数据依赖)
+// 第五轮: 读时按掩码还原到调用方缓冲——静态存储态永远是掩码态
 AMICE_FLATTEN_H /*L2AMICE*/
 const uint8_t* entangled_features(uint32_t* len) {
+    static uint8_t plain[ENC_FEATURES_LEN > 0 ? ENC_FEATURES_LEN : 1];
+    if (!g_win_set || g_features_len == 0) {
+        if (len) *len = 0;
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < g_features_len; ++i)
+        plain[i] = g_features_buf[i] ^ static_cast<uint8_t>(g_mask >> ((i & 7) * 8));
     if (len) *len = g_features_len;
-    return g_features_len ? g_features_buf : nullptr;
+    return plain;
 }
 
 // v2(审计 P0-1): 解码配置的消费者接口——检测线程随机源种子混合(flags/spare)与
 // 慢周期调制(tick)。垃圾解密 => 检测节奏与随机行为悄悄劣化, 而非单点 bool 失效。
 AMICE_FLATTEN_H /*L2AMICE*/
-uint32_t entangled_flags() { return g_win_set ? g_cfg.draw_flags : 0; }
+uint32_t entangled_flags() {
+    if (!g_win_set) return 0;
+    EntangledCfg c = g_cfg;   // 读时还原(副本), 静态态保持掩码
+    unmask_cfg(&c);
+    return c.draw_flags;
+}
 
 AMICE_FLATTEN_H /*L2AMICE*/
-uint32_t entangled_spare() { return g_win_set ? g_cfg.spare : 0; }
+AMICE_FLATTEN_H /*L2AMICE*/
+uint32_t entangled_spare() {
+    if (!g_win_set) return 0;
+    EntangledCfg c = g_cfg;   // 读时还原(副本)
+    unmask_cfg(&c);
+    return c.spare;
+}
 
 } // namespace t3

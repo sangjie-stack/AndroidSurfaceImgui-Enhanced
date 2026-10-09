@@ -153,7 +153,7 @@ void Layout_tick_UI(bool *main_thread_flag) {
         
     if (show_another_window) { // 3. Show another simple window.
         ImGui::Begin((const char*)AY_OBFUSCATE("另一个窗口"), &show_another_window);   // Pass a pointer to our bool variable (the window will have a closing button that will clear the bool when clicked)
-        ImGui::Text((const char*)AY_OBFUSCATE("另一个窗口的 爱坤!"));
+        ImGui::Text("%s", (const char*)AY_OBFUSCATE("另一个窗口的 爱坤!"));
         ImGui::Image(Aekun_image.DS, ImVec2(170, 170));
         if (ImGui::Button((const char*)AY_OBFUSCATE("关闭这个坤口"))) {
             show_another_window = false;

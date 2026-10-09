@@ -1044,6 +1044,39 @@ bool unicorn_check() {
     return true;
 }
 
+// ---------- L1.31: 内核单步过慢检测（第五轮: 对冲 lsdriver 系 stepbp 单步） ----------
+// 攻击者用内核 stepbp 逐指令单步跟踪检测函数时, 被步进区域每条指令一次内核往返,
+// 实测慢 100x 以上。本检测用固定负载环 + CNTVCT_EL0 计时:
+//   - 首调用记录基线(正常设备频率差异大, 不用常数阈值);
+//   - 之后每次与基线比对, 超 ~32x 记一次异常;
+//   - 连续 3 次异常才判 false —— DVFS 降频(~2-4x)单次不误杀, 单次随机抢占
+//     (调度延迟可达毫秒级)靠连续计数排除。
+// 边界: hwbp(断点不停核)不降速——本检测只抓单步/强降速; hwbp 由调用方双路径
+// 冗余比对(t3_gate)对冲。基线漂移只升不降, 防攻击者先降频压基线再攻击。
+namespace {
+thread_local uint64_t g_slow_base = 0;   // 基线(每线程独立, 免跨线程 DVFS 噪声)
+thread_local int      g_slow_hits = 0;   // 连续异常计数
+} // namespace
+
+AMICE_FLATTEN_H /*L2AMICE*/
+bool slowdown_check() {
+    volatile uint64_t sink = 0;
+    for (int i = 0; i < 8192; ++i) sink += static_cast<uint64_t>(i); // 固定负载
+    uint64_t t = 0;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t));
+    if (g_slow_base == 0) {          // 首调用=记录基线
+        g_slow_base = t;
+        g_slow_hits = 0;
+        return true;
+    }
+    uint64_t delta = t - g_slow_base;
+    bool slow = delta > (g_slow_base / 30) * 32;   // >~32x 基线记异常(含抖动余量)
+    if (!slow && delta > g_slow_base)              // 正常波动: 基线只升不降
+        g_slow_base += (delta - g_slow_base) / 2;
+    g_slow_hits = slow ? (g_slow_hits + 1) : 0;
+    return g_slow_hits < 3;
+}
+
 // ---------- L1.30: 命中投毒（反内存 dump） ----------
 // 壳厂 anti-dump 惯例：检测命中后向内存撒垃圾——攻击者 dump 到的是毒数据。
 // 实现：常驻 64KB 诱饵区（arm 前是伪随机填充，攻击者分析也无用；arm 后再随机化一次）。

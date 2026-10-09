@@ -117,6 +117,13 @@ void start_mem_watch_thread();
 //       返回 true=非模拟；false=疑似 Unicorn 模拟环境。
 bool unicorn_check();
 
+// L1.31: 内核单步过慢检测（第五轮: 对冲 lsdriver/内核 stepbp 单步）。
+//        内核单步执行被步进区域慢 >=100x(每条指令一次内核往返); 固定负载环
+//        用 CNTVCT_EL0 计时, 与首调用基线比对, 30x 阈值 + 连续 3 次命中才判
+//        (DVFS/温控波动 ~2-4x, 随机抢占靠连续计数排除)。首调用=记录基线。
+//       返回 true=正常; false=疑似单步/强降速干预。
+bool slowdown_check();
+
 // L1.28: 守护进程 ptrace 占位（主动反调试）。
 //        主进程 fork 守护进程，守护 PTRACE_ATTACH 主进程 → 攻击者任何 attach 都 EPERM。
 //        守护死 → 主进程 TracerPid 异常（0 或第三方）→ 检测闭环自杀。

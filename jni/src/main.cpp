@@ -67,6 +67,8 @@ static void fast_security_check() {
     if (!anti_extra::relro_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::libc_hook_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::unicorn_check()) { anti_extra::arm_detected(); return; }
+    // L1.31(第五轮): 内核单步过慢检测——对冲 lsdriver 系 stepbp 逐指令跟踪
+    if (!anti_extra::slowdown_check()) { anti_extra::arm_detected(); return; }
 }
 
 // 慢周期重检测（开销大：完整性自检读磁盘 ~2.9MB 逐段 memcmp；规则哈希重算）
