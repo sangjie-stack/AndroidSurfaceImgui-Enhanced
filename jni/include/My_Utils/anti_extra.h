@@ -22,6 +22,9 @@ namespace anti_extra {
 //   SEC_LIBC=0/1          L1.25 libc inline-hook 检测（默认开）
 //   SEC_MEMWATCH=0/1      L1.26 inotify 反内存 dump（默认开）
 //   SEC_UNICORN=0/1       L1.27 反 Unicorn 模拟器（默认开）
+//   SEC_GUARD=0/1         L1.28 守护进程 ptrace 占位（默认开）
+//   SEC_MAPWATCH=0/1      L1.29 maps 段数突变检测（默认开）
+//   SEC_POISON=0/1        L1.30 命中投毒（默认开）
 struct SecurityConfig {
     bool enable_injected   = true;
     bool enable_memfd      = true;
@@ -33,6 +36,9 @@ struct SecurityConfig {
     bool enable_libc       = true;
     bool enable_memwatch   = true;
     bool enable_unicorn    = true;
+    bool enable_guard      = true;
+    bool enable_mapwatch   = true;
+    bool enable_poison     = true;
     int  delay_min = 20;          // L1.14 延迟退出窗口下限(秒)
     int  delay_max = 90;          // L1.14 延迟退出窗口上限(秒)
     int  thread_baseline = -1;    // L1.17 线程基线（-1=未定，首个周期自动设定）
@@ -110,6 +116,23 @@ void start_mem_watch_thread();
 //          ② faccessat2(439)/openat2(437) 返回 ENOSYS 且内核 >= 5.10 → Unicorn 无 syscall hook。
 //       返回 true=非模拟；false=疑似 Unicorn 模拟环境。
 bool unicorn_check();
+
+// L1.28: 守护进程 ptrace 占位（主动反调试）。
+//        主进程 fork 守护进程，守护 PTRACE_ATTACH 主进程 → 攻击者任何 attach 都 EPERM。
+//        守护死 → 主进程 TracerPid 异常（0 或第三方）→ 检测闭环自杀。
+//        main() 最早调用（须在 startup_security_check 之前）。
+void start_guard_process();
+// 供 GhostTrace Method1/Method2 白名单：当前守护 pid（未启动返回 -1）。
+extern "C" int gt_guard_pid(void);
+// 守护状态：-1=attach 中（放行 TracerPid==0），1=存活，0=已死（检出），-2=未启用。
+int guard_state();
+
+// L1.29: maps 段数突变检测（防注入新映射段）。
+//        历史 max 基线 + 连续 2 次超阈值才判（防瞬时/渐进 mmap 误杀）。
+bool maps_spike_check();
+
+// L1.30: 命中投毒（arm 后向诱饵区撒随机毒数据，反 dump）。
+void poison_memory();
 
 // L1.16: 检测规则数据自校验（白名单前缀表等关键常量哈希比对）。
 //        首次调用记录基线哈希；此后重算比对，不一致 = 检测逻辑被 patch。

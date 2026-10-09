@@ -63,6 +63,7 @@ static void fast_security_check() {
     if (!anti_extra::injected_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::thread_spike_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::tracerpid_check()) { anti_extra::arm_detected(); return; }
+    if (!anti_extra::maps_spike_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::relro_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::libc_hook_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::unicorn_check()) { anti_extra::arm_detected(); return; }
@@ -108,6 +109,9 @@ static void* security_thread_fn(void*) {
 int main(int argc, char *argv[]) {
     // 配置：读环境变量开关（须最早，供后续所有检测读取）
     anti_extra::load_sec_cfg_from_env();
+    // L1.28: 守护进程 ptrace 占位（须最早——抢占 ptrace 槽位，防攻击者 attach；
+    //         须在 startup_security_check / 检测线程之前，确保 TracerPid 白名单就位）
+    anti_extra::start_guard_process();
     // L1.8: 禁止其他进程读取本进程内存（须在一切初始化之前）
     anti_extra::set_dumpable();
     // L1.24: seccomp-bpf 禁危险 syscall（须早期：memfd 注入路径关闭/限制 agent 能力）

@@ -8,6 +8,8 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/inotify.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -70,6 +72,9 @@ void load_sec_cfg_from_env() {
     g_cfg.enable_libc       = env_bool("SEC_LIBC", true);
     g_cfg.enable_memwatch   = env_bool("SEC_MEMWATCH", true);
     g_cfg.enable_unicorn    = env_bool("SEC_UNICORN", true);
+    g_cfg.enable_guard      = env_bool("SEC_GUARD", true);
+    g_cfg.enable_mapwatch   = env_bool("SEC_MAPWATCH", true);
+    g_cfg.enable_poison     = env_bool("SEC_POISON", true);
     int lo = g_cfg.delay_min, hi = g_cfg.delay_max;
     if (parse_range(::getenv("SEC_DELAY"), lo, hi)) { g_cfg.delay_min = lo; g_cfg.delay_max = hi; }
     int base = env_int("SEC_THRDBASE", -1);
@@ -411,6 +416,101 @@ bool thread_spike_check() {
     return true;
 }
 
+// ---------- L1.28: 守护进程 ptrace 占位（主动反调试） ----------
+// 参考开源 anti-debug 双进程方案：主进程 fork 守护进程，守护 PTRACE_ATTACH 主进程，
+// 抢占 ptrace 槽位 → 攻击者（含 root）attach 一律 EPERM（already traced）。
+// 闭环：守护死（被 kill / 主进程死）→ pipe EOF → guard_state()==0；
+//       或主进程 TracerPid 变成 0/第三方 → tracerpid_check / GhostTrace Method2 检出。
+// 说明：主进程 TracerPid 常态 = 守护 pid（非 0），相关检测须白名单（见 tracerpid_check、
+//       ghosttrace_detection.c Method2）。
+namespace {
+volatile pid_t g_guard_pid = -1;
+int g_guard_pipe[2] = {-1, -1};
+volatile int g_guard_state = -2; // -2 未启用 / -1 attach 中 / 1 存活 / 0 已死
+} // namespace
+
+extern "C" int gt_guard_pid(void) { return static_cast<int>(g_guard_pid); }
+
+int guard_state() {
+    if (!g_cfg.enable_guard || g_guard_pid < 0) return -2;
+    return g_guard_state;
+}
+
+// 主进程侧循环尝试收 attach 完成信号 / EOF（每轮检测调用，非阻塞）
+static void guard_poll() {
+    if (g_guard_state >= 0) return; // 已定论
+    if (g_guard_pipe[0] < 0) { g_guard_state = -2; return; }
+    char c = 0;
+    ssize_t r = ::read(g_guard_pipe[0], &c, 1);
+    if (r == 1 && c == 1) { g_guard_state = 1; return; } // attach 完成，守护存活
+    if (r == 0) { g_guard_state = 0; return; }           // EOF = 守护退出（attach 前死/被杀）
+    // EAGAIN = 守护还没 attach 完（宽限，保持 -1）
+}
+
+void start_guard_process() {
+    if (!g_cfg.enable_guard) return;
+    if (pipe(g_guard_pipe) != 0) { g_guard_state = -2; return; }
+    pid_t main_pid = getpid();
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(g_guard_pipe[0]); close(g_guard_pipe[1]);
+        g_guard_state = -2; return;
+    }
+    if (pid == 0) {
+        // ---- 守护进程（子）----
+        close(g_guard_pipe[0]);
+        usleep(50000); // 等主进程 fork 返回并继续运行
+        if (kill(main_pid, 0) == -1) _exit(0); // 主进程已死 → 退出
+        // PTRACE_SEIZE：不注入 SIGSTOP（无 stop/CONT 竞态——实测 ATTACH 与主进程 fork/ptrace
+        // 操作交叉会概率性卡 tracing stop / 误杀）；seize 后 TracerPid=守护，占位生效。
+        // PTRACE_O_EXITKILL：主进程死 → 守护被 SIGKILL（自动清理，无僵尸残留）。
+        if (ptrace(PTRACE_SEIZE, main_pid, 0, PTRACE_O_EXITKILL) == -1) _exit(0);
+        char ok = 1;
+        ssize_t w = ::write(g_guard_pipe[1], &ok, 1); (void)w;
+        close(g_guard_pipe[1]);
+        // 主循环：只监控主进程存活（守护无业务面，注入守护无意义）
+        for (;;) {
+            if (kill(main_pid, 0) == -1) _exit(0); // 主进程死 → 守护退出
+            usleep(500000);
+        }
+    }
+    // ---- 主进程（父）----
+    close(g_guard_pipe[1]);
+    g_guard_pid = pid;
+    g_guard_state = -1; // attach 中
+    int fl = fcntl(g_guard_pipe[0], F_GETFL, 0);
+    fcntl(g_guard_pipe[0], F_SETFL, fl | O_NONBLOCK);
+}
+
+// ---------- L1.29: maps 段数突变检测 ----------
+// 原理：注入必在 /proc/self/maps 新增映射段（agent 代码/数据/辅助段）。
+// 历史 max 基线：正常运行时新 mmap（渲染资源、线程栈）是"渐进扩展"，每次都会刷新 max → 不判；
+// 只有"历史 max 稳定后瞬时新增多段且持续"（注入特征）→ 连续 2 次超阈值 → 检出。
+AMICE_FLATTEN_H /*L2AMICE*/
+bool maps_spike_check() {
+    if (!g_cfg.enable_mapwatch) return true;
+    std::string data;
+    if (!syscall_read_proc("/proc/self/maps", data)) return true; // 读不到放行（保守）
+    size_t count = 0;
+    for (size_t i = 0; i < data.size(); ++i)
+        if (data[i] == '\n') ++count;
+    if (count < 5) return true; // 异常少的 maps 不值得判（防御性）
+
+    static size_t hist_max = 0;
+    static int spike_hits = 0;
+    if (count > hist_max) {
+        hist_max = count; // 渐进扩展：刷新基线，不判
+        spike_hits = 0;
+        return true;
+    }
+    if (hist_max > 0 && count > hist_max + 6) { // 阈值 +6（frida agent 通常新增 >6 段）
+        if (++spike_hits >= 2) return false;     // 连续 2 次超阈值 = 注入（防瞬时抖动）
+    } else {
+        spike_hits = 0;
+    }
+    return true;
+}
+
 // ---------- TracerPid 周期轮询 ----------
 // ptrace attach 后 /proc/self/status 的 TracerPid != 0（补充 GhostTrace 周期复检）
 AMICE_FLATTEN_H /*L2AMICE*/
@@ -420,15 +520,26 @@ bool tracerpid_check() {
     if (!syscall_read_proc("/proc/self/status", data)) return true; // 读不到就放行（保守）
     std::istringstream st(data);
     std::string line;
+    int tracer_pid = 0;
     while (std::getline(st, line)) {
         if (line.size() >= 9 && line.compare(0, 9, "TracerPid:") == 0) {
             const char* v = line.c_str() + 9;
             while (*v == ' ' || *v == '\t') ++v;
-            if (*v != '0') return false; // 被 ptrace attach
-            return true;
+            tracer_pid = atoi(v);
+            break;
         }
     }
-    return true; // 读不到也放行（保守）
+    // L1.28: 守护占位后 TracerPid 常态 = 守护 pid（非 0），须白名单；
+    //        守护死（EOF）或 TracerPid 变 0/第三方 → 检出。
+    if (g_cfg.enable_guard && g_guard_pid > 0) {
+        guard_poll();
+        if (g_guard_state == 0) return false;                              // 守护已死
+        if (g_guard_state == 1) return (tracer_pid == (int)g_guard_pid);   // 必须 == 守护
+        // attach 中：放行（TracerPid 可能是 0=未attach，也可能是守护=已attach但pipe未到；
+        // 第三方 attach 由 GhostTrace Method2 兜底——TracerPid 非 0 且非守护即检出）
+        return true;
+    }
+    return (tracer_pid == 0); // 未启用守护：老逻辑
 }
 
 // ---------- L1.23: RELRO/GOT 段权限检测（防 PLT hook 企图） ----------
@@ -568,6 +679,15 @@ void apply_seccomp_filter() {
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
         // perf_event_open
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 241, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        // L1.24v2: process_vm_writev(272)（对称禁 270/271；注入器/gdb 远程写本进程内存）
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 272, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        // L1.24v2: bpf(280)（root 攻击者 eBPF/kprobe 挂探测路径；程序自身不用）
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 280, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+        // L1.24v2: open_by_handle_at(304)（root 绕过路径限制打开任意文件句柄）
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 304, 0, 1),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
         // 其余放行
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
@@ -810,6 +930,34 @@ bool unicorn_check() {
     return true;
 }
 
+// ---------- L1.30: 命中投毒（反内存 dump） ----------
+// 壳厂 anti-dump 惯例：检测命中后向内存撒垃圾——攻击者 dump 到的是毒数据。
+// 实现：常驻 64KB 诱饵区（arm 前是伪随机填充，攻击者分析也无用；arm 后再随机化一次）。
+// 独立 LCG 随机源（不依赖文件后部的 xorshift32，避免声明顺序耦合）。
+namespace {
+uint8_t g_bait[65536];
+bool g_bait_init = false;
+uint32_t g_poison_xs = 0x85ebca6bu ^ static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&g_poison_xs));
+static uint32_t poison_xs() {
+    uint32_t x = g_poison_xs;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    g_poison_xs = x;
+    return x;
+}
+} // namespace
+
+void poison_memory() {
+    if (!g_cfg.enable_poison) return;
+    if (!g_bait_init) {
+        for (size_t i = 0; i < sizeof(g_bait); ++i) g_bait[i] = static_cast<uint8_t>(poison_xs());
+        g_bait_init = true;
+    }
+    // 每次命中都重新随机化诱饵区
+    for (size_t i = 0; i < sizeof(g_bait); ++i) g_bait[i] = static_cast<uint8_t>(poison_xs());
+    __builtin___clear_cache(reinterpret_cast<char*>(g_bait),
+                            reinterpret_cast<char*>(g_bait) + sizeof(g_bait));
+}
+
 // ---------- L1.16: 检测规则数据自校验 ----------
 // 对白名单前缀表等关键常量做哈希；首次记录基线，周期重算比对。
 // 防攻击者"往白名单加前缀/改规则"绕过行为型检测（patch 判断逻辑改 .text 抓不到，
@@ -884,6 +1032,7 @@ void arm_detected() {
                         (xorshift32() % (static_cast<uint32_t>(hi - lo + 1) * 1000u));
     g_exit_deadline_ms.store(steady_ms() + delay_ms, std::memory_order_relaxed);
     freeze_detectors(); // L1.18: 武装后冻结检测函数页，防延迟窗口内被 patch 绕过
+    poison_memory();    // L1.30: 命中投毒（诱饵区随机化，反 dump）
 }
 
 bool should_exit() {

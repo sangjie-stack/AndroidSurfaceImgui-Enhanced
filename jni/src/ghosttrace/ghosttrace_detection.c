@@ -163,15 +163,34 @@ gt_result_t gt_detect_debugger(gt_detection_result_t *result) {
  * ptrace-based debugger detection
  * Works on both Linux and macOS
  */
+/* L1.28: 守护进程 ptrace 占位 pid（anti_extra.cpp 提供，未启用返回 -1） */
+extern int gt_guard_pid(void);
+
 gt_result_t gt_detect_ptrace(void) {
     GT_LOG_DEBUG("Checking for ptrace-based debuggers");
     
 #if PLATFORM_LINUX
     /* Method 1: Try to ptrace ourselves using direct syscall for stealth */
+    /* L1.28: 守护进程 SEIZE 占位启用时跳过本探测——主进程已被跟踪，fork 的子进程会继承
+       跟踪状态，其 TRACEME 触发 syscall-stop 卡死；占位本身已挡第三方 attach（EPERM）。 */
+    if (gt_guard_pid() <= 0) {
     pid_t child = fork();
     if (child == 0) {
         /* Child process */
         if (syscall(SYS_ptrace, PTRACE_TRACEME, 0, NULL, NULL) == -1) {
+            /* L1.28: 守护进程 attach 后 fork 的子进程继承 ptrace 状态——TRACEME 必然失败。
+               此时读自身 TracerPid：若 == 守护 pid → 继承自守护，放行（exit 0）。 */
+            int tp = 0;
+            const char* sp = "/proc/self/status";
+            FILE* f = fopen(sp, "r");
+            if (f) {
+                char line[256];
+                while (fgets(line, sizeof(line), f)) {
+                    if (strncmp(line, "TracerPid:", 10) == 0) { tp = atoi(line + 10); break; }
+                }
+                fclose(f);
+            }
+            if (tp == gt_guard_pid()) exit(0);
             /* ptrace failed, likely already being traced */
             exit(1);
         }
@@ -184,6 +203,7 @@ gt_result_t gt_detect_ptrace(void) {
             GT_LOG_WARNING("ptrace detection: already being traced");
             return GT_ERROR_DEBUGGER_DETECTED;
         }
+    }
     }
     
     /* Method 2: Check /proc/self/status for TracerPid */
@@ -198,7 +218,8 @@ gt_result_t gt_detect_ptrace(void) {
             if (strncmp(line, s_tracer_pid, 9) == 0) {
                 int tracer_pid = atoi(line + 10);
                 fclose(status_file);
-                if (tracer_pid != 0) {
+                /* L1.28 白名单：守护进程 ptrace 占位后 TracerPid 常态 = 守护 pid（非 0） */
+                if (tracer_pid != 0 && tracer_pid != gt_guard_pid()) {
                     GT_LOG_WARNING("ptrace detection: TracerPid = %d", tracer_pid);
                     return GT_ERROR_DEBUGGER_DETECTED;
                 }
@@ -216,10 +237,25 @@ gt_result_t gt_detect_ptrace(void) {
     
 #elif PLATFORM_ANDROID
     /* Android ptrace detection - similar to Linux but with Android-specific checks */
+    /* L1.28: 守护进程 SEIZE 占位启用时跳过本探测（同 Linux 分支理由） */
+    if (gt_guard_pid() <= 0) {
     pid_t child = fork();
     if (child == 0) {
         /* Child process */
         if (ptrace(PTRACE_TRACEME, 0, NULL, NULL) == -1) {
+            /* L1.28: 守护进程 attach 后 fork 的子进程继承 ptrace 状态——TRACEME 必然失败。
+               此时读自身 TracerPid：若 == 守护 pid → 继承自守护，放行（exit 0）。 */
+            int tp = 0;
+            const char* sp = "/proc/self/status";
+            FILE* f = fopen(sp, "r");
+            if (f) {
+                char line[256];
+                while (fgets(line, sizeof(line), f)) {
+                    if (strncmp(line, "TracerPid:", 10) == 0) { tp = atoi(line + 10); break; }
+                }
+                fclose(f);
+            }
+            if (tp == gt_guard_pid()) exit(0);
             /* ptrace failed, likely already being traced */
             exit(1);
         }
@@ -232,6 +268,7 @@ gt_result_t gt_detect_ptrace(void) {
             GT_LOG_WARNING("ptrace detection: already being traced");
             return GT_ERROR_DEBUGGER_DETECTED;
         }
+    }
     }
     
 #elif PLATFORM_MACOS
