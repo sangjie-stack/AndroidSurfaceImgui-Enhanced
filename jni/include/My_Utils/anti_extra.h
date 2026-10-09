@@ -16,7 +16,8 @@ namespace anti_extra {
 //   SEC_DELAY=min-max   延迟退出窗口秒（默认 20-90）
 //   SEC_THRDBASE=N      线程基线（默认启动后首个周期自动设定）
 //   SEC_THRDLIMIT=N     线程突变阈值（默认 3）
-//   SEC_INTV=min-max    检测周期秒（默认 2-5）
+//   SEC_FAST_INTV=min-max 快周期（注入面轻检测）秒（默认 1-2）
+//   SEC_SLOW_INTV=min-max 慢周期（完整性重检测）秒（默认 4-8）
 struct SecurityConfig {
     bool enable_injected   = true;
     bool enable_memfd      = true;
@@ -28,8 +29,10 @@ struct SecurityConfig {
     int  delay_max = 90;          // L1.14 延迟退出窗口上限(秒)
     int  thread_baseline = -1;    // L1.17 线程基线（-1=未定，首个周期自动设定）
     int  thread_threshold = 3;    // L1.17 线程突变阈值（超基线+阈值=注入）
-    int  interval_min = 2;        // L1.15 检测周期下限(秒)
-    int  interval_max = 5;        // L1.15 检测周期上限(秒)
+    int  fast_interval_min = 1;   // L1.15 快周期下限(秒)——注入面轻检测
+    int  fast_interval_max = 2;   // L1.15 快周期上限(秒)
+    int  slow_interval_min = 4;   // L1.15 慢周期下限(秒)——完整性重检测
+    int  slow_interval_max = 8;   // L1.15 慢周期上限(秒)
 };
 // 进程级配置单例（main() 最早期 load_sec_cfg_from_env() 后只读）
 SecurityConfig& sec_cfg();

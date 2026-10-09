@@ -7,8 +7,16 @@
 #include "t3_gate.h"         //T3卡密验证门禁(终端流程, 官方示例一致)
 #include <pthread.h>
 #include <unistd.h>
+#include <chrono>
 extern "C" {
 #include "ghosttrace.h"      //L3: 反调试/反Frida/反Xposed (GhostTrace, MIT)
+}
+
+// 毫秒时钟（检测线程分层计时用）
+static uint64_t ms_now() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
 // 轻量随机源（线程局部 xorshift，避免 rand 竞争）
@@ -44,9 +52,10 @@ static bool startup_security_check() {
     return true;
 }
 
-// 周期安全检查：检出 → 武装延迟退出（伪装正常，防行为反推）
+// 快周期轻检测（注入面）：高频率抓"瞬态注入"（注入后很快分离的 agent，
+// 慢周期会错过窗口——实测 kxmwp 短暂注入 t+5.3s 自动分离）
 AMICE_FLATTEN_H /*L2AMICE*/
-static void periodic_security_check() {
+static void fast_security_check() {
     if (gt_detect_ptrace() != GT_SUCCESS) { anti_extra::arm_detected(); return; }
     if (gt_detect_android_frida() != GT_SUCCESS) { anti_extra::arm_detected(); return; }
     if (gt_detect_android_xposed() != GT_SUCCESS) { anti_extra::arm_detected(); return; }
@@ -54,24 +63,42 @@ static void periodic_security_check() {
     if (!anti_extra::injected_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::thread_spike_check()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::tracerpid_check()) { anti_extra::arm_detected(); return; }
-    if (!anti_extra::rules_selfcheck()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::relro_check()) { anti_extra::arm_detected(); return; }
+}
+
+// 慢周期重检测（开销大：完整性自检读磁盘 ~2.9MB 逐段 memcmp；规则哈希重算）
+AMICE_FLATTEN_H /*L2AMICE*/
+static void slow_security_check() {
+    if (!anti_extra::rules_selfcheck()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::integrity_check()) { anti_extra::arm_detected(); return; }
 }
 
-// L1.15: 独立检测线程——随机周期 2~5 秒（环境变量 SEC_INTV 可调），防攻击者摸清检测节奏；
-//        与渲染循环解耦（单点被 patch 不影响另一触发点）；
-//        检测线程自身也是退出执行者（主循环被卡/被 patch 时 2~5s 内必然退出）
+// L1.15: 独立检测线程——时序分层（环境变量 SEC_FAST_INTV / SEC_SLOW_INTV 可调）：
+//   快周期 1~2s：注入面轻检测（maps/status/线程数，开销小）→ 瞬态注入必命中；
+//   慢周期 4~8s：完整性自检 + 规则自校验（开销大，低频率）。
+// 与渲染循环解耦（单点被 patch 不影响另一触发点）；检测线程自身也是退出执行者
+AMICE_FLATTEN_H /*L2AMICE*/
 static void* security_thread_fn(void*) {
+    const anti_extra::SecurityConfig& c = anti_extra::sec_cfg();
+    uint64_t next_slow = 0; // 首轮快检测后立即跑一次慢检测
     for (;;) {
-        const anti_extra::SecurityConfig& c = anti_extra::sec_cfg();
-        useconds_t wait_us = static_cast<useconds_t>(c.interval_min) * 1000000u +
-            (tick_xorshift() % (static_cast<useconds_t>(c.interval_max - c.interval_min + 1) * 1000000u));
+        useconds_t wait_us = static_cast<useconds_t>(c.fast_interval_min) * 1000000u +
+            (tick_xorshift() % (static_cast<useconds_t>(c.fast_interval_max - c.fast_interval_min + 1) * 1000000u));
         usleep(wait_us);
         anti_extra::heartbeat_ping(); // L1.21: 检测线程存活心跳
-        periodic_security_check();
+        fast_security_check();
         if (anti_extra::should_exit())
             _exit(42);
+
+        uint64_t now = ms_now();
+        if (now >= next_slow) {
+            slow_security_check();
+            if (anti_extra::should_exit())
+                _exit(42);
+            useconds_t sw = static_cast<useconds_t>(c.slow_interval_min) * 1000000u +
+                (tick_xorshift() % (static_cast<useconds_t>(c.slow_interval_max - c.slow_interval_min + 1) * 1000000u));
+            next_slow = now + static_cast<uint64_t>(sw / 1000u);
+        }
     }
     return nullptr;
 }

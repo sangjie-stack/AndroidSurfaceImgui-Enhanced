@@ -63,8 +63,10 @@ void load_sec_cfg_from_env() {
     int base = env_int("SEC_THRDBASE", -1);
     if (base >= 0) g_cfg.thread_baseline = base;
     g_cfg.thread_threshold = env_int("SEC_THRDLIMIT", 3);
-    lo = g_cfg.interval_min; hi = g_cfg.interval_max;
-    if (parse_range(::getenv("SEC_INTV"), lo, hi)) { g_cfg.interval_min = lo; g_cfg.interval_max = hi; }
+    lo = g_cfg.fast_interval_min; hi = g_cfg.fast_interval_max;
+    if (parse_range(::getenv("SEC_FAST_INTV"), lo, hi)) { g_cfg.fast_interval_min = lo; g_cfg.fast_interval_max = hi; }
+    lo = g_cfg.slow_interval_min; hi = g_cfg.slow_interval_max;
+    if (parse_range(::getenv("SEC_SLOW_INTV"), lo, hi)) { g_cfg.slow_interval_min = lo; g_cfg.slow_interval_max = hi; }
     g_cfg_loaded.store(true, std::memory_order_relaxed);
 }
 
