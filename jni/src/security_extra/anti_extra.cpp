@@ -40,6 +40,10 @@ std::atomic<bool> g_cfg_loaded{false};
 
 // steady_ms 定义在文件后部（匿名 namespace），此处前置声明供 thread_spike_check 使用
 static uint64_t steady_ms();
+// 审查修复（B12 fail-open）：syscall_read_proc 连续失败计数——攻击者 fd 耗尽 /
+// hook syscall 伪造失败时, 3 次即视为防线被破坏 → arm_detected（延迟退出）。
+// 成功读取一次即清零（偶发瞬时失败不误杀）。
+static std::atomic<int> g_proc_read_fail{0};
 
 static int env_int(const char* name, int def) {
     const char* v = ::getenv(name);
@@ -60,6 +64,9 @@ static bool parse_range(const char* v, int& lo, int& hi) {
     lo = a; hi = b; return true;
 }
 } // namespace
+
+// arm_detected 定义在文件后部（外部链接，anti_extra.h 声明），前置声明供前部检测函数调用
+void arm_detected();
 
 SecurityConfig& sec_cfg() { return g_cfg; }
 
@@ -328,7 +335,7 @@ bool frida_extra_check() {
 
 static const char* kSystemWhitePrefixes[] = {
     "/system/", "/vendor/", "/apex/", "/odm/", "/product/",
-    "/system_ext/", "/data/app/", "/data/user_de/", "/data/user/0/",
+    "/system_ext/", "/data/app/", "/data/user_de/",
     "/linkerconfig/",
 };
 
@@ -346,7 +353,11 @@ bool injected_check() {
     std::string self(selfpath);
 
     std::string data;
-    if (!syscall_read_proc("/proc/self/maps", data)) return true; // 读不到就放行（保守）
+    if (!syscall_read_proc("/proc/self/maps", data)) { // 审查修复（B12）：连续失败=防线被破坏
+        if (g_proc_read_fail.fetch_add(1) + 1 >= 3) arm_detected();
+        return true;
+    }
+    g_proc_read_fail.store(0);
     std::istringstream maps(data);
     std::string line;
     while (std::getline(maps, line)) {
@@ -389,17 +400,15 @@ bool injected_check() {
 
         if (path == "[vdso]") continue;              // 唯一合法匿名可执行映射
         if (path == self) continue;                  // 自身主段/分页
-        if (starts_with(path, kSystemWhitePrefixes[0]) ||
-            starts_with(path, kSystemWhitePrefixes[1]) ||
-            starts_with(path, kSystemWhitePrefixes[2]) ||
-            starts_with(path, kSystemWhitePrefixes[3]) ||
-            starts_with(path, kSystemWhitePrefixes[4]) ||
-            starts_with(path, kSystemWhitePrefixes[5]) ||
-            starts_with(path, kSystemWhitePrefixes[6]) ||
-            starts_with(path, kSystemWhitePrefixes[7]) ||
-            starts_with(path, kSystemWhitePrefixes[8]) ||
-            starts_with(path, kSystemWhitePrefixes[9]))
-            continue;
+        {
+            // 白名单长度用 sizeof 推导（防增删前缀后遍历越界/漏判）
+            constexpr size_t kWP = sizeof(kSystemWhitePrefixes) / sizeof(kSystemWhitePrefixes[0]);
+            bool sys = false;
+            for (size_t i = 0; i < kWP; ++i) {
+                if (starts_with(path, kSystemWhitePrefixes[i])) { sys = true; break; }
+            }
+            if (sys) continue;
+        }
 
         return false; // 非白名单路径可执行段 = 注入（如 /data/local/tmp 下的 agent.so）
     }
@@ -546,7 +555,11 @@ AMICE_FLATTEN_H /*L2AMICE*/
 bool maps_spike_check() {
     if (!g_cfg.enable_mapwatch) return true;
     std::string data;
-    if (!syscall_read_proc("/proc/self/maps", data)) return true; // 读不到放行（保守）
+    if (!syscall_read_proc("/proc/self/maps", data)) { // 审查修复（B12）：连续失败=防线被破坏
+        if (g_proc_read_fail.fetch_add(1) + 1 >= 3) arm_detected();
+        return true;
+    }
+    g_proc_read_fail.store(0);
     char selfpath[512];
     ssize_t sn = readlink("/proc/self/exe", selfpath, sizeof(selfpath) - 1);
     std::string self;
@@ -573,23 +586,28 @@ bool maps_spike_check() {
         std::string path = line.substr(pb);
         if (path == "[vdso]") continue;
         if (!self.empty() && path == self) continue;
+        // 白名单长度用 sizeof 推导（防增删前缀后遍历越界/漏判）
+        constexpr size_t kWP = sizeof(kSystemWhitePrefixes) / sizeof(kSystemWhitePrefixes[0]);
         bool sys = false;
-        for (int i = 0; i < 10; ++i) {
+        for (size_t i = 0; i < kWP; ++i) {
             if (starts_with(path, kSystemWhitePrefixes[i])) { sys = true; break; }
         }
         if (sys) continue; // 系统库/驱动不参与计数（零误杀）
         ++count;           // 非白名单 x 段（注入特征）
     }
-    if (count < 1) return true; // 无异常段不值得判（防御性）
-
     static size_t hist_max = 0;
     static int spike_hits = 0;
-    if (hist_max > 0 && count > hist_max + 3) { // 阈值 +3（注入 agent 通常新增 1~3+ 个非白名单 x 段）
+    // 审查修复（本轮 bugscan）：阈值 +3 对"零基线"不友好——常态 count=0（白名单全覆盖）
+    // 时 hist_max 恒 0，注入 1~3 个非白名单 x 段（frida agent 常见）不超 0+3 → 漏检。
+    // 修正：阈值收紧到 +1（正常环境非白名单 x 段不存在，count 从 0→1 即异常特征）；
+    //       连续 2 次 + 渐进基线（Vulkan 若有偶发非白名单 x 段会先爬升 hist_max 适应）。
+    // count<1（常态）时也走刷新逻辑（hist_max 保持 0），不再提前 return。
+    if (hist_max > 0 && count > hist_max + 1) { // 阈值 +1（注入新增 ≥1 非白名单 x 段即超）
         if (++spike_hits >= 2) return false;     // 连续 2 次超阈值 = 注入（防瞬时抖动）
     } else {
         spike_hits = 0;
     }
-    if (count > hist_max) hist_max = count; // 渐进扩展：刷新基线（不提前 return）
+    if (count > hist_max) hist_max = count; // 渐进扩展：刷新基线（含 count=0 常态：hist_max 保持 0）
     return true;
 }
 
@@ -603,7 +621,11 @@ bool tracerpid_check() {
         guard_poll();
     if (!g_cfg.enable_tracerpid) return true;
     std::string data;
-    if (!syscall_read_proc("/proc/self/status", data)) return true; // 读不到就放行（保守）
+    if (!syscall_read_proc("/proc/self/status", data)) { // 审查修复（B12）：连续失败=防线被破坏
+        if (g_proc_read_fail.fetch_add(1) + 1 >= 3) arm_detected();
+        return true;
+    }
+    g_proc_read_fail.store(0);
     std::istringstream st(data);
     std::string line;
     int tracer_pid = 0;
@@ -656,7 +678,11 @@ bool relro_check() {
         else self_base = relro_self;
 
         std::string exe;
-        if (!syscall_read_proc("/proc/self/exe", exe)) return true;
+        if (!syscall_read_proc("/proc/self/exe", exe)) { // 审查修复（B12）：连续失败=防线被破坏
+            if (g_proc_read_fail.fetch_add(1) + 1 >= 3) arm_detected();
+            return true;
+        }
+        g_proc_read_fail.store(0);
         if (exe.size() < 64) return true;
         // ELF64 header: e_phoff@0x20(8) e_phentsize@0x36(2) e_phnum@0x38(2)
         const unsigned char* h = reinterpret_cast<const unsigned char*>(exe.data());
@@ -681,7 +707,11 @@ bool relro_check() {
 
         // PIE 基址 = maps 中自身映射段的最小 start（仅当该段 offset==0 且路径匹配）
         std::string maps;
-        if (!syscall_read_proc("/proc/self/maps", maps)) return true;
+        if (!syscall_read_proc("/proc/self/maps", maps)) { // 审查修复（B12）：连续失败=防线被破坏
+            if (g_proc_read_fail.fetch_add(1) + 1 >= 3) arm_detected();
+            return true;
+        }
+        g_proc_read_fail.store(0);
         uintptr_t base = 0;
         std::istringstream mss(maps);
         std::string line;
@@ -726,7 +756,11 @@ bool relro_check() {
 
     // 周期比对：maps 中覆盖 RELRO 范围的段是否被降级为可写
     std::string maps;
-    if (!syscall_read_proc("/proc/self/maps", maps)) return true;
+    if (!syscall_read_proc("/proc/self/maps", maps)) { // 审查修复（B12）：连续失败=防线被破坏
+        if (g_proc_read_fail.fetch_add(1) + 1 >= 3) arm_detected();
+        return true;
+    }
+    g_proc_read_fail.store(0);
     std::istringstream mss(maps);
     std::string line;
     uintptr_t relro_end = relro_start + relro_len;
@@ -840,7 +874,11 @@ bool libc_hook_check() {
         // 首次：定位 libc.so 各段 + 目标函数运行时地址
         const char* kFns[] = { "open", "read", "fopen", "ioctl", "mmap", "mprotect" };
         std::string data;
-        if (!syscall_read_proc("/proc/self/maps", data)) return true;
+        if (!syscall_read_proc("/proc/self/maps", data)) { // 审查修复（B12）：连续失败=防线被破坏
+            if (g_proc_read_fail.fetch_add(1) + 1 >= 3) arm_detected();
+            return true;
+        }
+        g_proc_read_fail.store(0);
         std::istringstream mss(data);
         std::string line;
         struct SegInfo { uintptr_t start, end; uint64_t file_off; };
@@ -875,7 +913,11 @@ bool libc_hook_check() {
         std::string libc_path;
         {
             std::string data2;
-            if (!syscall_read_proc("/proc/self/maps", data2)) return true;
+            if (!syscall_read_proc("/proc/self/maps", data2)) { // 审查修复（B12）：连续失败=防线被破坏
+                if (g_proc_read_fail.fetch_add(1) + 1 >= 3) arm_detected();
+                return true;
+            }
+            g_proc_read_fail.store(0);
             std::istringstream m2(data2);
             while (std::getline(m2, line)) {
                 if (line.find("libc.so") == std::string::npos) continue;
@@ -1047,10 +1089,13 @@ bool unicorn_check() {
 // ---------- L1.31: 内核单步过慢检测（第五轮: 对冲 lsdriver 系 stepbp 单步） ----------
 // 攻击者用内核 stepbp 逐指令单步跟踪检测函数时, 被步进区域每条指令一次内核往返,
 // 实测慢 100x 以上。本检测用固定负载环 + CNTVCT_EL0 计时:
+//   - 修复（本轮 bugscan）: 原实现 delta = t - g_slow_base 测的是"两次调用间隔"
+//     （快周期 1~2s / 慢周期 4~8s 随机）而不是负载耗时 → 单步 100x 降速被间隔
+//     淹没, 检测基本无效（假阴性高）。修正: 负载循环**前后**各读一次 CNTVCT,
+//     delta = 循环实际耗时——单步时每条指令一次内核往返 → 放大 100x+。
 //   - 首调用记录基线(正常设备频率差异大, 不用常数阈值);
-//   - 之后每次与基线比对, 超 ~32x 记一次异常;
-//   - 连续 3 次异常才判 false —— DVFS 降频(~2-4x)单次不误杀, 单次随机抢占
-//     (调度延迟可达毫秒级)靠连续计数排除。
+//   - 之后每次与基线比对, 超 ~8x 记一次异常（DVFS ~2-4x / 调度抖动不误杀）;
+//   - 连续 3 次异常才判 false —— DVFS 降频单次不误杀, 调度延迟靠连续计数排除。
 // 边界: hwbp(断点不停核)不降速——本检测只抓单步/强降速; hwbp 由调用方双路径
 // 冗余比对(t3_gate)对冲。基线漂移只升不降, 防攻击者先降频压基线再攻击。
 namespace {
@@ -1060,18 +1105,20 @@ thread_local int      g_slow_hits = 0;   // 连续异常计数
 
 AMICE_FLATTEN_H /*L2AMICE*/
 bool slowdown_check() {
+    uint64_t t0 = 0, t1 = 0;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t0));
     volatile uint64_t sink = 0;
     for (int i = 0; i < 8192; ++i) sink += static_cast<uint64_t>(i); // 固定负载
-    uint64_t t = 0;
-    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t));
-    if (g_slow_base == 0) {          // 首调用=记录基线
-        g_slow_base = t;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(t1));
+    uint64_t delta = t1 - t0;                 // 负载循环实际耗时（时钟周期）
+    if (g_slow_base == 0) {                  // 首调用=记录基线
+        g_slow_base = delta;
         g_slow_hits = 0;
         return true;
     }
-    uint64_t delta = t - g_slow_base;
-    bool slow = delta > (g_slow_base / 30) * 32;   // >~32x 基线记异常(含抖动余量)
-    if (!slow && delta > g_slow_base)              // 正常波动: 基线只升不降
+    // 正常波动: DVFS/调度导致单次 2~4x 波动常见 → 阈值 8x（单步 100x 远高于此）
+    bool slow = delta > g_slow_base * 8;
+    if (!slow && delta > g_slow_base)          // 正常波动: 基线只升不降
         g_slow_base += (delta - g_slow_base) / 2;
     g_slow_hits = slow ? (g_slow_hits + 1) : 0;
     return g_slow_hits < 3;

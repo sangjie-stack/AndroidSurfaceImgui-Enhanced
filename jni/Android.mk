@@ -9,6 +9,31 @@ include $(PREBUILT_STATIC_LIBRARY)
 
 
 # =============================================================================
+#  [L3-tls] mbedTLS 静态库 (TLS 传输层)
+# =============================================================================
+#  用途: t3sdk.cpp 的 httpPostRaw 原为裸 socket 明文 HTTP(且把 https 降到 80 端口),
+#        现改由 src/t3sdk/tls_transport.cpp 走 mbedTLS 真 TLS。
+#  选型: mbedTLS 3.6.4 LTS / Apache-2.0 / 纯 C 零异常(与全局 -fno-exceptions 兼容)。
+#  产物来源: tools/build_mbedtls_arm64.sh 在 Ubuntu 上交叉编译 (NDK r30, API 22)。
+#  注意: 预编译静态库不会像源码模块那样把 C++ feature(exceptions) 传播到主模块,
+#        所以这里安全 —— 这也是不能用"源码子模块"方式引入的原因(见上方接线说明)。
+include $(CLEAR_VARS)
+LOCAL_MODULE := lib_mbedtls
+LOCAL_SRC_FILES := prebuilt/mbedtls/$(TARGET_ARCH_ABI)/libmbedtls.a
+include $(PREBUILT_STATIC_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := lib_mbedx509
+LOCAL_SRC_FILES := prebuilt/mbedtls/$(TARGET_ARCH_ABI)/libmbedx509.a
+include $(PREBUILT_STATIC_LIBRARY)
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := lib_mbedcrypto
+LOCAL_SRC_FILES := prebuilt/mbedtls/$(TARGET_ARCH_ABI)/libmbedcrypto.a
+include $(PREBUILT_STATIC_LIBRARY)
+
+
+# =============================================================================
 #  [L2-amice] 接线说明
 # =============================================================================
 #  AMICE_PLUGIN_FLAG   命令行注入 -fpass-plugin=<bundle>/amice/lib/libamice.so
@@ -52,6 +77,9 @@ LOCAL_CPPFLAGS += -DVK_USE_PLATFORM_ANDROID_KHR
 LOCAL_CPPFLAGS += -DIMGUI_IMPL_VULKAN_NO_PROTOTYPES
 LOCAL_CPPFLAGS += -DIMGUI_DISABLE_DEBUG_TOOLS #禁用imgui调试工具
 LOCAL_CPPFLAGS += -DIMGUI_ENABLE_FREETYPE     #启用imgui的freetype支持
+# L3-tls: mbedTLS 裁剪配置头 (由 tools/build_mbedtls_arm64.sh 生成, 见 include/mbedtls_config_android.h)
+LOCAL_CFLAGS   += -DMBEDTLS_CONFIG_FILE='"mbedtls_config_android.h"'
+LOCAL_CPPFLAGS += -DMBEDTLS_CONFIG_FILE='"mbedtls_config_android.h"'
 ifeq ($(AMICE_DROP_DEMO),1)
   LOCAL_CPPFLAGS += -DIMGUI_DISABLE_DEMO_WINDOWS #L2: 剥离 imgui_demo 死代码指纹
 endif
@@ -115,6 +143,7 @@ LOCAL_SRC_FILES += src/ghosttrace/ghosttrace_breakpoints.c
 LOCAL_SRC_FILES += src/ghosttrace/ghosttrace_android.c
 LOCAL_SRC_FILES += src/security_extra/anti_extra.cpp  #L1.6/L1.8/L1.9: 完整性自检+dumpable+反Frida多向量
 LOCAL_SRC_FILES += src/t3sdk/t3sdk.cpp               #T3验证SDK(纯C++, 无OpenSSL依赖; L2: 异常自由化)
+LOCAL_SRC_FILES += src/t3sdk/tls_transport.cpp       #L3: mbedTLS TLS 传输层(替代裸 socket 明文 HTTP)
 LOCAL_SRC_FILES += src/t3_gate.cpp    #T3卡密验证门禁(密钥AY_OBFUSCATE加密)
 LOCAL_SRC_FILES += src/entangle/entangle_decode.cpp  #服务端密钥纠缠: core派生key解密业务配置
     
@@ -126,5 +155,6 @@ LOCAL_LDLIBS += -lz #freetype需要
 LOCAL_LDFLAGS += -Wl,--gc-sections -Wl,-z,relro,-z,now #L0加固: 裁剪未用段/RELRO安全加固
 LOCAL_LDFLAGS += -s #L0加固: 链接期 strip 全部符号（去符号表，静态分析难度↑）
 LOCAL_STATIC_LIBRARIES := lib_git_freetype
+LOCAL_STATIC_LIBRARIES += lib_mbedtls lib_mbedx509 lib_mbedcrypto  #L3: TLS 传输层
 
 include $(BUILD_EXECUTABLE) #可执行文件

@@ -5,6 +5,7 @@
 
 #include "amice_annotate.h"   //L2: amice 混淆注解
 #include "t3sdk.h"
+#include "tls_transport.h"    //L3: mbedTLS TLS 传输层 (替代裸 socket 明文 HTTP)
 #include "obfuscate.h" /*L1: PEM定界符编译期加密*/
 #include <cstdio>
 #include <cstdlib>
@@ -726,7 +727,11 @@ bool connectWithTimeout(int sock, const struct sockaddr *address, int addressLen
 std::string httpPostRaw(const std::string& url, const std::string& postData) {
     URLInfo info;
     if(!parseUrl(url,info)) return "";
-    
+
+#ifdef _WIN32
+    /* ---- 桌面调试分支 (不进 Android 产物) ----
+       桌面构建不链接 mbedTLS 静态库, 沿用原明文实现仅供本地调试。
+       Application.mk 只出 arm64-v8a, 生产路径是下方 #else 的 TLS 分支。 */
     /* HTTPS降级为HTTP（与C版本一致） */
     if(info.protocol=="https") info.port=80;
     
@@ -821,6 +826,20 @@ std::string httpPostRaw(const std::string& url, const std::string& postData) {
     if(bodyPos!=std::string::npos)
         return response.substr(bodyPos+4);
     return response;
+
+#else  /* ---- Android 生产分支: 强制 TLS ---- */
+
+    /* 只走 TLS。失败直接返回空串, 交由上层切换备用线路。
+       刻意【不提供明文回退】—— 原实现把 https 降到 80 端口, 那等于
+       给攻击者留了一条降级通道; 现在宁可整条线路失败, 也不明文出网。 */
+    if(info.protocol=="https"){
+        std::string body;
+        if(t3tls::httpsPost(info.host,info.port,info.path,postData,body))
+            return body;
+    }
+    return "";
+
+#endif
 }
 
 } /* end anonymous namespace */
