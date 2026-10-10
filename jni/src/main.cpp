@@ -71,11 +71,16 @@ static void fast_security_check() {
     if (!anti_extra::slowdown_check()) { anti_extra::arm_detected(); return; }
 }
 
-// 慢周期重检测（开销大：完整性自检读磁盘 ~2.9MB 逐段 memcmp；规则哈希重算）
+// 慢周期重检测（开销大：完整性自检读磁盘 ~2.9MB 逐段 memcmp；规则哈希重算；
+// E3 网络探测 / E1 pagemap 读——低频，不影响快周期）
 AMICE_FLATTEN_H /*L2AMICE*/
 static void slow_security_check() {
     if (!anti_extra::rules_selfcheck()) { anti_extra::arm_detected(); return; }
     if (!anti_extra::integrity_check()) { anti_extra::arm_detected(); return; }
+    // E3（Sentry 方案）：Frida 随机端口 D-Bus AUTH 探测（网络 IO，慢周期）
+    if (!anti_extra::frida_dbus_probe()) { anti_extra::arm_detected(); return; }
+    // E1（Sentry 方案）：pagemap soft-dirty 脏页检测（libc fork 页被写=被 hook）
+    if (!anti_extra::pagemap_dirty_check()) { anti_extra::arm_detected(); return; }
 }
 
 // L1.15: 独立检测线程——时序分层（环境变量 SEC_FAST_INTV / SEC_SLOW_INTV 可调）：
@@ -118,6 +123,8 @@ int main(int argc, char *argv[]) {
     // L1.28: 守护进程 ptrace 占位（须最早——抢占 ptrace 槽位，防攻击者 attach；
     //         须在 startup_security_check / 检测线程之前，确保 TracerPid 白名单就位）
     anti_extra::start_guard_process();
+    // E2（Sentry 方案）：SIGTRAP Hook 陷阱专用线程（独立线程，信号链完整性）
+    anti_extra::start_sigtrap_thread();
     // L1.8: 禁止其他进程读取本进程内存（须在一切初始化之前）
     anti_extra::set_dumpable();
     // L1.24: seccomp-bpf 禁危险 syscall（须早期：memfd 注入路径关闭/限制 agent 能力）

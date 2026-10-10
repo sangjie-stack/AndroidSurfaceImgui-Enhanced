@@ -25,6 +25,9 @@ namespace anti_extra {
 //   SEC_GUARD=0/1         L1.28 守护进程 ptrace 占位（默认开）
 //   SEC_MAPWATCH=0/1      L1.29 maps 段数突变检测（默认开）
 //   SEC_POISON=0/1        L1.30 命中投毒（默认开）
+//   SEC_DBUS=0/1          E3   Frida 随机端口 D-Bus AUTH 探测（默认开）
+//   SEC_SIGTRAP=0/1       E2   SIGTRAP Hook 陷阱（信号链完整性，默认开）
+//   SEC_PAGEMAP=0/1       E1   pagemap soft-dirty 脏页检测（默认开）
 struct SecurityConfig {
     bool enable_injected   = true;
     bool enable_memfd      = true;
@@ -39,6 +42,9 @@ struct SecurityConfig {
     bool enable_guard      = true;
     bool enable_mapwatch   = true;
     bool enable_poison     = true;
+    bool enable_dbus       = true;  // E3: Frida 随机端口 D-Bus AUTH 探测
+    bool enable_sigtrap    = true;  // E2: SIGTRAP Hook 陷阱
+    bool enable_pagemap    = true;  // E1: pagemap soft-dirty 脏页检测
     int  delay_min = 20;          // L1.14 延迟退出窗口下限(秒)
     int  delay_max = 90;          // L1.14 延迟退出窗口上限(秒)
     int  thread_baseline = -1;    // L1.17 线程基线（-1=未定，首个周期自动设定）
@@ -162,5 +168,23 @@ void freeze_detectors();
 void arm_detected();
 // 每帧调用；true=倒计时已到，应立即 _exit(42)。
 bool should_exit();
+
+// E3（Sentry 方案）: Frida 随机端口 D-Bus AUTH 探测——对 127.0.0.1/0.0.0.0 的
+// LISTEN 端口发短 D-Bus AUTH 探测，frida server 回 REJECTED/ERROR 强特征。
+// 慢周期调用（网络 IO，不放大周期）。返回 true=干净；false=发现 frida。
+bool frida_dbus_probe();
+
+// E2（Sentry 方案）: SIGTRAP Hook 陷阱——专用线程安装 SIGTRAP handler 并周期性
+// tgkill 自发性 SIGTRAP；handler 内 siglongjmp 跳回。若 Frida signal chaining
+// 吞掉/重排信号（handler 未执行 → longjmp 未发生）→ 佐证信号链被篡改。
+// 返回 true=干净；false=信号链异常。
+bool sigtrap_trap_check();
+// 启动 SIGTRAP 陷阱专用线程（main 早期调用一次）。
+void start_sigtrap_thread();
+
+// E1（Sentry 方案）: pagemap soft-dirty (bit 55) 脏页检测——内核维护，用户态无法伪造。
+// 查 libc fork 函数所在页是否被写（frida inline hook libc 导出后该页 soft-dirty=1；
+// 正常共享只读代码段不会被写）。返回 true=干净；false=检测到脏页（代码被 hook 过）。
+bool pagemap_dirty_check();
 
 } // namespace anti_extra

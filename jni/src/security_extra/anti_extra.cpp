@@ -10,6 +10,12 @@
 #include <sys/inotify.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <signal.h>
+#include <setjmp.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -92,6 +98,9 @@ void load_sec_cfg_from_env() {
     g_cfg.enable_guard      = env_bool("SEC_GUARD", true);
     g_cfg.enable_mapwatch   = env_bool("SEC_MAPWATCH", true);
     g_cfg.enable_poison     = env_bool("SEC_POISON", true);
+    g_cfg.enable_dbus       = env_bool("SEC_DBUS", true);        // E3
+    g_cfg.enable_sigtrap    = env_bool("SEC_SIGTRAP", true);     // E2
+    g_cfg.enable_pagemap    = env_bool("SEC_PAGEMAP", true);     // E1
     int lo = g_cfg.delay_min, hi = g_cfg.delay_max;
     if (parse_range(::getenv("SEC_DELAY"), lo, hi)) { g_cfg.delay_min = lo; g_cfg.delay_max = hi; }
     int base = env_int("SEC_THRDBASE", -1);
@@ -1316,6 +1325,165 @@ void freeze_detectors() {
         last_page = page;
         ::mprotect(reinterpret_cast<void*>(page), 4096, PROT_READ | PROT_EXEC);
     }
+}
+
+// ---------- E3: Frida 随机端口 D-Bus AUTH 探测（Sentry 方案） ----------
+// frida 16+ server 端口可随机（默认 27042 可改）；固定端口检测失效。
+// D-Bus AUTH 协议是强特征：对 127.0.0.1/0.0.0.0 的全部 LISTEN 端口发短
+// "AUTH" 探测，frida server 回 REJECTED/ERROR（普通 TCP 服务不回 D-Bus 响应）。
+// 只扫本机回环/任意监听端口（不触外部网络）；每次 150ms 超时；上限 20 端口防阻塞。
+namespace {
+// 对单个端口发 D-Bus AUTH 探测。返回 true=命中 frida 特征。
+static bool dbus_probe_port(int port) {
+    int s = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return false;
+    // 非阻塞 connect + poll 短超时
+    int fl = ::fcntl(s, F_GETFL, 0);
+    ::fcntl(s, F_SETFL, fl | O_NONBLOCK);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(static_cast<uint16_t>(port));
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 只探 127.0.0.1
+    int r = ::connect(s, reinterpret_cast<struct sockaddr*>(&a), sizeof(a));
+    if (r != 0 && errno != EINPROGRESS) { ::close(s); return false; }
+    struct pollfd pfd;
+    pfd.fd = s; pfd.events = POLLOUT; pfd.revents = 0;
+    r = ::poll(&pfd, 1, 150);
+    if (r <= 0 || (pfd.revents & POLLOUT) == 0) { ::close(s); return false; }
+    // 已连上 → 发 D-Bus AUTH（协议首字节 0x00 + "AUTH\r\n"）
+    static const unsigned char auth[] = { 0x00, 'A','U','T','H','\r','\n' };
+    (void)::send(s, auth, sizeof(auth), MSG_NOSIGNAL);
+    // 读响应（150ms）
+    char buf[256];
+    ssize_t n = 0;
+    for (int i = 0; i < 3; ++i) {
+        struct pollfd in;
+        in.fd = s; in.events = POLLIN; in.revents = 0;
+        r = ::poll(&in, 1, 150);
+        if (r <= 0 || (in.revents & POLLIN) == 0) break;
+        ssize_t m = ::recv(s, buf + n, sizeof(buf) - 1 - static_cast<size_t>(n), MSG_NOSIGNAL);
+        if (m <= 0) break;
+        n += m;
+        if (n >= static_cast<ssize_t>(sizeof(buf)) - 1) break;
+    }
+    ::close(s);
+    if (n <= 0) return false;
+    buf[n] = '\0';
+    // frida D-Bus 响应强特征：REJECTED / ERROR（D-Bus 协议握手失败应答）
+    if (strstr(buf, "REJECTED") || strstr(buf, "ERROR")) return true;
+    return false;
+}
+} // namespace
+
+bool frida_dbus_probe() {
+    if (!g_cfg.enable_dbus) return true;
+    std::string data;
+    if (!syscall_read_proc("/proc/net/tcp", data)) return true; // 读失败放行（保守）
+    std::vector<int> ports;
+    std::istringstream ss(data);
+    std::string line;
+    std::getline(ss, line); // 跳 header
+    while (std::getline(ss, line) && static_cast<int>(ports.size()) < 20) {
+        // 字段: sl local_address rem_address st ...
+        std::istringstream ls(line);
+        std::string f0, f1, f2, f3;
+        ls >> f0 >> f1 >> f2 >> f3;
+        if (f3 != "0A") continue; // 仅 LISTEN
+        size_t colon = f1.find(':');
+        if (colon == std::string::npos) continue;
+        std::string ip = f1.substr(0, colon);
+        if (ip != "0100007F" && ip != "00000000") continue; // 仅回环/任意监听
+        int port = 0;
+        std::istringstream hs(f1.substr(colon + 1));
+        hs >> std::hex >> port;
+        if (port > 0 && port < 65536) ports.push_back(port);
+    }
+    for (int port : ports) {
+        if (dbus_probe_port(port)) return false; // 命中 frida
+    }
+    return true;
+}
+
+// ---------- E2: SIGTRAP Hook 陷阱（Sentry 方案） ----------
+// 专用 pthread 安装 SIGTRAP handler；周期性 tgkill 只向本线程发 SIGTRAP；
+// handler 内设标志 + siglongjmp 跳回循环。若 Frida 的 signal chaining 吞掉/重排
+// 信号（handler 未执行 → longjmp 未发生）→ 标志不置位 → 判定信号链被篡改。
+// siglongjmp 从 handler 跳回（防 SIGTRAP 默认动作终止进程），与 Sentry 一致。
+namespace {
+volatile sig_atomic_t g_sigtrap_hit = 0;
+static jmp_buf g_sigtrap_jb;
+
+static void sigtrap_handler(int) {
+    g_sigtrap_hit = 1;
+    siglongjmp(g_sigtrap_jb, 1); // 跳回陷阱线程主循环（同线程，安全）
+}
+
+static void* sigtrap_thread_fn(void*) {
+    if (!g_cfg.enable_sigtrap) return nullptr;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigtrap_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; // 不设 SA_RESTART：重排/吞信号场景更明显
+    if (::sigaction(SIGTRAP, &sa, nullptr) != 0) return nullptr; // 装不上就放弃
+    // 随机周期 3~6s
+    uint32_t xs = static_cast<uint32_t>(steady_ms()) ^ 0x9e3779b9u;
+    for (;;) {
+        xs ^= xs << 13; xs ^= xs >> 17; xs ^= xs << 5;
+        useconds_t w = 3000000u + (xs % 3000000u);
+        ::usleep(w);
+        g_sigtrap_hit = 0;
+        // 预置跳回点（必须在 tgkill 前）
+        if (sigsetjmp(g_sigtrap_jb, 1) == 0) {
+            pid_t tid = static_cast<pid_t>(::syscall(SYS_gettid));
+            ::syscall(SYS_tgkill, ::getpid(), tid, SIGTRAP);
+            // 正常路径：handler 已 siglongjmp 回来，这里不会执行到；
+            // 若 handler 被吞（未 longjmp）→ tgkill 后 SIGTRAP 默认动作=终止进程
+            ::usleep(500000); // 冗余等待（防信号延迟）
+        }
+        if (g_sigtrap_hit == 0) arm_detected(); // handler 未执行 = 信号链被篡改
+    }
+    return nullptr;
+}
+} // namespace
+
+bool sigtrap_trap_check() {
+    // 单次检查语义：陷阱线程持续运行，此处返回 true（干净）——
+    // 命中由陷阱线程内部 arm_detected() 处理（长期运行型防线）。
+    return true;
+}
+
+void start_sigtrap_thread() {
+    pthread_t t;
+    if (::pthread_create(&t, nullptr, sigtrap_thread_fn, nullptr) == 0) {
+        ::pthread_detach(t);
+    }
+}
+
+// ---------- E1: pagemap soft-dirty (bit 55) 脏页检测（Sentry 方案） ----------
+// 内核维护 soft-dirty：页被写则置位，用户态无法伪造（比用户态自校验更强）。
+// 检测 libc fork 函数所在页——frida inline hook libc 导出函数后该页被写
+// （mprotect RW + patch → COW → soft-dirty=1）；正常共享只读代码段不被写。
+// 注意：pagemap 在 untrusted_app 上由内核策略返回 0 化页表（Sentry spec 注明）——
+// 我们是 KernelSU root 裸 ELF，可读。soft-dirty 是累计位（一旦被写持久为 1），
+// 语义 = "该页曾被写"（hook 历史或现在）；对 libc 关键函数页，正常必须为 0。
+bool pagemap_dirty_check() {
+    if (!g_cfg.enable_pagemap) return true;
+    void* fn = ::dlsym(RTLD_DEFAULT, "fork");
+    if (!fn) return true; // 取不到函数就放行（保守）
+    long psz = ::sysconf(_SC_PAGESIZE);
+    if (psz <= 0) return true;
+    uintptr_t page = reinterpret_cast<uintptr_t>(fn) & ~(static_cast<uintptr_t>(psz) - 1);
+    long fd = ::syscall(SYS_openat, AT_FDCWD, "/proc/self/pagemap", O_RDONLY);
+    if (fd < 0) return true; // 读不到放行（权限受限场景不误杀）
+    uint64_t entry = 0;
+    uint64_t idx = static_cast<uint64_t>(page) / static_cast<uint64_t>(psz);
+    ssize_t r = ::syscall(SYS_pread64, fd, &entry, 8, static_cast<off_t>(idx * 8));
+    ::syscall(SYS_close, fd);
+    if (r != 8) return true;
+    // bit55 = soft-dirty（Sentry 注释强调：不要用 bit 61——文件映射恒为 1 会误报）
+    return (entry & (1ULL << 55)) == 0; // true=干净；false=该页被写过（代码被 hook）
 }
 
 } // namespace anti_extra
