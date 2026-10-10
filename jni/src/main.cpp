@@ -81,6 +81,8 @@ static void slow_security_check() {
     if (!anti_extra::frida_dbus_probe()) { anti_extra::arm_detected(); return; }
     // E1（Sentry 方案）：pagemap soft-dirty 脏页检测（libc fork 页被写=被 hook）
     if (!anti_extra::pagemap_dirty_check()) { anti_extra::arm_detected(); return; }
+    // F1（Sentry 思路）：smaps 可执行段 Private_Dirty（读 smaps 较重，慢周期）
+    if (!anti_extra::smaps_dirty_check()) { anti_extra::arm_detected(); return; }
 }
 
 // L1.15: 独立检测线程——时序分层（环境变量 SEC_FAST_INTV / SEC_SLOW_INTV 可调）：

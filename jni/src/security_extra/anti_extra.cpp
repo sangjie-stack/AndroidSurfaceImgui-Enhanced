@@ -101,6 +101,9 @@ void load_sec_cfg_from_env() {
     g_cfg.enable_dbus       = env_bool("SEC_DBUS", true);        // E3
     g_cfg.enable_sigtrap    = env_bool("SEC_SIGTRAP", true);     // E2
     g_cfg.enable_pagemap    = env_bool("SEC_PAGEMAP", true);     // E1
+    g_cfg.enable_smaps      = env_bool("SEC_SMAPS", true);       // F1
+    g_cfg.enable_tramp      = env_bool("SEC_TRAMP", true);       // F2
+    g_cfg.enable_got        = env_bool("SEC_GOT", true);         // F3
     int lo = g_cfg.delay_min, hi = g_cfg.delay_max;
     if (parse_range(::getenv("SEC_DELAY"), lo, hi)) { g_cfg.delay_min = lo; g_cfg.delay_max = hi; }
     int base = env_int("SEC_THRDBASE", -1);
@@ -344,6 +347,8 @@ bool frida_extra_check() {
     if (scan_maps_frida()) return false;
     if (scan_threads_frida()) return false;
     if (scan_ida_server()) return false;   // A: IDA 调试服务器
+    if (!trampoline_scan_check()) return false;  // F2: ARM64 trampoline 模式
+    if (!got_hook_check()) return false;         // F3: GOT/PLT 劫持
     return true;
 }
 
@@ -1484,6 +1489,160 @@ bool pagemap_dirty_check() {
     if (r != 8) return true;
     // bit55 = soft-dirty（Sentry 注释强调：不要用 bit 61——文件映射恒为 1 会误报）
     return (entry & (1ULL << 55)) == 0; // true=干净；false=该页被写过（代码被 hook）
+}
+
+// ---------- F1: smaps 可执行段 Private_Dirty 检测（Sentry 通道一） ----------
+// 原理：系统库代码段是文件映射、多进程只读共享，正常 Private_Dirty 应为 0。
+// frida inline hook libc/libart 等 → COW 私有副本 → 该可执行段 Private_Dirty>0。
+// 防误杀：① 白名单路径放行（code_cache/JIT 等正常 COW 场景）；② 连续 2 次检测
+// 都命中才 arm（瞬态/系统偶发写不误杀）。
+static int g_smaps_hit = 0;
+bool smaps_dirty_check() {
+    if (!g_cfg.enable_smaps) return true;
+    std::string data;
+    if (!syscall_read_proc("/proc/self/smaps", data)) return true; // 读失败放行
+    bool suspicious = false;
+    const char* p = data.c_str();
+    bool in_exec = false;
+    const char* mapping_path = nullptr;
+    size_t mapping_path_len = 0;
+    while (*p) {
+        const char* eol = strchr(p, '\n');
+        size_t len = eol ? static_cast<size_t>(eol - p) : strlen(p);
+        if (len >= 4 && (memmem(p, len, "r-xp", 4) || memmem(p, len, "r-x ", 4))) {
+            // 映射行：找路径（行尾空格后）
+            in_exec = true;
+            mapping_path = nullptr; mapping_path_len = 0;
+            const char* sp = p;
+            const char* last_space = nullptr;
+            for (size_t i = 0; i < len; i++) { if (sp[i] == ' ') last_space = sp + i; }
+            if (last_space) {
+                const char* path = last_space + 1;
+                while (*path == ' ') path++;
+                mapping_path = path;
+                mapping_path_len = static_cast<size_t>(eol - path);
+            }
+        } else if (in_exec && len >= 12 && memmem(p, len, "Private_Dirty:", 14)) {
+            long kb = 0;
+            if (sscanf(p, "Private_Dirty: %ld kB", &kb) == 1 && kb > 0) {
+                // 白名单：JIT/code_cache 等正常私有脏页
+                bool whitelisted = false;
+                const char* wl[] = { "code_cache", "libstagefright", "[anon:libc_malloc]", "app_jit" };
+                for (auto* w : wl) {
+                    if (mapping_path && memmem(mapping_path, mapping_path_len, w, strlen(w))) { whitelisted = true; break; }
+                }
+                if (!whitelisted && mapping_path) {
+                    // 仅对可疑系统库/自身路径判脏（匿名或普通路径不判，降低误杀）
+                    const char* su[] = { "/system/", "/vendor/", "/apex/", "/odm/", "/product/",
+                                         "/system_ext/", "/data/app/", "/linkerconfig/",
+                                         "/data/local/tmp/", "AndroidSurfaceImguiEnhanced" };
+                    bool system_map = false;
+                    for (auto* s : su) {
+                        if (memmem(mapping_path, mapping_path_len, s, strlen(s))) { system_map = true; break; }
+                    }
+                    if (system_map) suspicious = true;
+                }
+            }
+            in_exec = false; // 一个段只统计一次
+        } else if (*p == '-' || *p == 'S' || *p == 'N') {
+            // 新映射行复位（权限行后跟的统计行之间可能没有 r-x 前缀）
+            if (!(len >= 4 && (memmem(p, len, "r-xp", 4) || memmem(p, len, "r-x ", 4)))) in_exec = false;
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+    if (suspicious) {
+        if (++g_smaps_hit >= 2) { g_smaps_hit = 0; return false; } // 连续 2 次命中才 arm
+    } else {
+        g_smaps_hit = 0; // 干净则清零（防一次误触持续生效）
+    }
+    return true;
+}
+
+// ---------- F2: ARM64 trampoline 模式扫描（OWASP MASTG / Sentry） ----------
+// frida Interceptor 的典型 inline hook 尾部（ARM64）：
+//   LDR X16, [PC, #8]   = 50 00 00 58
+//   BR  X16             = 00 02 1F D6
+// 注意：此模式在正常 PLT veneer / 长跳转 stub 中同样常见（libc 导出函数解析到
+// PLT 后头部就含它）——所以【不能扫函数头部】（实测必误报）。
+// 只扫【纯匿名可执行段】（无路径、无 [anon 标记）——正常 Android 环境此类段
+// 几乎不存在（vdso 带 [vdso] 标记，JIT/GPU 代码带 [anon:dalvik-jit / kgsl 等标记），
+// frida memfd/裸 mmap 注入的 agent 代码恰落在这里。≥3 命中才 arm 降误报。
+static bool scan_trampoline_region(const unsigned char* base, size_t len) {
+    static const unsigned char pat[8] = { 0x50, 0x00, 0x00, 0x58, 0x00, 0x02, 0x1F, 0xD6 };
+    int hits = 0;
+    if (len < 8) return false;
+    for (size_t i = 0; i + 8 <= len; i += 4) { // 指令对齐步进
+        if (memcmp(base + i, pat, 8) == 0) {
+            if (++hits >= 3) return true; // 三处以上典型 trampoline = 注入
+        }
+    }
+    return false;
+}
+bool trampoline_scan_check() {
+    if (!g_cfg.enable_tramp) return true;
+    std::string maps;
+    if (!syscall_read_proc("/proc/self/maps", maps)) return true;
+    size_t pos = 0;
+    while (pos < maps.size()) {
+        size_t eol = maps.find('\n', pos);
+        if (eol == std::string::npos) eol = maps.size();
+        std::string line = maps.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.find("r-xp") == std::string::npos && line.find("r-x ") == std::string::npos) continue;
+        size_t sp = line.rfind(' ');
+        std::string path = (sp == std::string::npos) ? "" : line.substr(sp + 1);
+        // 只扫纯匿名段：路径为空且无 [ 前缀标记（vdso/[anon:*] 都带标记，跳过）
+        if (!path.empty()) continue;
+        unsigned long long start = 0, end = 0;
+        if (sscanf(line.c_str(), "%llx-%llx", &start, &end) != 2) continue;
+        size_t len = static_cast<size_t>(end - start);
+        if (len < 8 || len > (32u << 20)) continue; // 限 32MB 内
+        const unsigned char* mem = reinterpret_cast<const unsigned char*>(start);
+        if (scan_trampoline_region(mem, len)) return false;
+    }
+    return true;
+}
+
+// ---------- F3: GOT/PLT 劫持检测（OWASP MASTG） ----------
+// dlsym 解析的关键函数地址若落在"匿名可执行段/非系统库文件映射"内 → GOT/PLT 被劫持
+// （xHook 类工具把 PLT 条目改到注入代码）。正常 libc 函数地址在 libc.so 的 r-xp 段。
+bool got_hook_check() {
+    if (!g_cfg.enable_got) return true;
+    std::string maps;
+    if (!syscall_read_proc("/proc/self/maps", maps)) return true;
+    const char* names[] = { "open", "read", "write", "close", "fork", "ptrace", "connect", "recvfrom" };
+    for (auto* n : names) {
+        void* fn = ::dlsym(RTLD_DEFAULT, n);
+        if (!fn) continue;
+        uintptr_t addr = reinterpret_cast<uintptr_t>(fn);
+        // 在 maps 中找地址所在映射
+        size_t pos = 0;
+        bool in_legit = false;
+        while (pos < maps.size()) {
+            size_t eol = maps.find('\n', pos);
+            if (eol == std::string::npos) eol = maps.size();
+            std::string line = maps.substr(pos, eol - pos);
+            pos = eol + 1;
+            unsigned long long start = 0, end = 0;
+            if (sscanf(line.c_str(), "%llx-%llx", &start, &end) != 2) continue;
+            if (addr >= start && addr < end) {
+                // 权限必须含 x 且路径是系统库（.so 文件映射）
+                bool exec = line.find("r-xp") != std::string::npos || line.find("r-x ") != std::string::npos;
+                size_t sp = line.rfind(' ');
+                std::string path = (sp == std::string::npos) ? "" : line.substr(sp + 1);
+                if (exec && (path.find(".so") != std::string::npos &&
+                             (path.find("/system/") == 0 || path.find("/apex/") == 0 ||
+                              path.find("/vendor/") == 0 || path.find("/odm/") == 0 ||
+                              path.find("/product/") == 0 || path.find("/linkerconfig/") == 0))) {
+                    in_legit = true;
+                }
+                break;
+            }
+        }
+        if (!in_legit) return false; // 关键函数不在合法系统库映射内 = GOT/PLT 劫持
+    }
+    return true;
 }
 
 } // namespace anti_extra
