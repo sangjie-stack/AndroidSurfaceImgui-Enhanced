@@ -83,6 +83,9 @@ static void slow_security_check() {
     if (!anti_extra::pagemap_dirty_check()) { anti_extra::arm_detected(); return; }
     // F1（Sentry 思路）：smaps 可执行段 Private_Dirty（读 smaps 较重，慢周期）
     if (!anti_extra::smaps_dirty_check()) { anti_extra::arm_detected(); return; }
+    // G1（MASTG-KNOW-0032 / RiskEngine 思路）：libc 关键函数页 disk-vs-memory 比对
+    //   （每轮 pread 10 个函数页 40KB，开销可接受；直接字节比对抓一切 inline hook）
+    if (!anti_extra::libc_text_check()) { anti_extra::arm_detected(); return; }
 }
 
 // L1.15: 独立检测线程——时序分层（环境变量 SEC_FAST_INTV / SEC_SLOW_INTV 可调）：

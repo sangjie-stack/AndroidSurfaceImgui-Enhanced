@@ -31,6 +31,7 @@ namespace anti_extra {
 //   SEC_SMAPS=0/1         F1   smaps 可执行段 Private_Dirty 检测（默认开）
 //   SEC_TRAMP=0/1         F2   ARM64 trampoline 模式扫描（默认开）
 //   SEC_GOT=0/1           F3   GOT/PLT 劫持检测（默认开）
+//   SEC_LIBCTXT=0/1       G1   libc 关键函数页 disk-vs-memory 比对（默认开）
 struct SecurityConfig {
     bool enable_injected   = true;
     bool enable_memfd      = true;
@@ -51,6 +52,7 @@ struct SecurityConfig {
     bool enable_smaps      = true;  // F1: smaps 可执行段 Private_Dirty 检测
     bool enable_tramp      = true;  // F2: ARM64 trampoline 模式扫描
     bool enable_got        = true;  // F3: GOT/PLT 劫持检测
+    bool enable_libctxt    = true;  // G1: libc 关键函数页 disk-vs-memory 比对
     int  delay_min = 20;          // L1.14 延迟退出窗口下限(秒)
     int  delay_max = 90;          // L1.14 延迟退出窗口上限(秒)
     int  thread_baseline = -1;    // L1.17 线程基线（-1=未定，首个周期自动设定）
@@ -93,6 +95,13 @@ bool trampoline_scan_check();
 //     关键 libc 函数经 dlsym 解析后，地址必须落在系统库文件映射（r-xp .so）内；
 //     若落在匿名可执行段/非系统库 → GOT/PLT 被劫持（xHook 类）。返回 true=干净。
 bool got_hook_check();
+
+// G1: libc 关键函数页 disk-vs-memory 比对（OWASP MASTG-KNOW-0032 Memory Checksums /
+//     RiskEngine native_integrity 思路）。
+//     dlsym 拿到函数地址 → 页对齐 → 由 maps 文件 offset 推算磁盘偏移 → pread 磁盘页
+//     → memcmp 内存页 vs 磁盘页。任何 inline hook（不管 trampoline 长啥样）都会改
+//     内存字节 → 不等 → arm。连续 2 次命中才 arm 防误报。返回 true=干净。
+bool libc_text_check();
 
 // L1.13: 行为型注入检测（不依赖特征串，针对魔改版 Frida）。
 //         可执行段必须属于：自身 / [vdso] / 系统白名单前缀；

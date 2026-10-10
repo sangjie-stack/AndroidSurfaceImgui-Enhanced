@@ -104,6 +104,7 @@ void load_sec_cfg_from_env() {
     g_cfg.enable_smaps      = env_bool("SEC_SMAPS", true);       // F1
     g_cfg.enable_tramp      = env_bool("SEC_TRAMP", true);       // F2
     g_cfg.enable_got        = env_bool("SEC_GOT", true);         // F3
+    g_cfg.enable_libctxt    = env_bool("SEC_LIBCTXT", true);     // G1
     int lo = g_cfg.delay_min, hi = g_cfg.delay_max;
     if (parse_range(::getenv("SEC_DELAY"), lo, hi)) { g_cfg.delay_min = lo; g_cfg.delay_max = hi; }
     int base = env_int("SEC_THRDBASE", -1);
@@ -1641,6 +1642,81 @@ bool got_hook_check() {
             }
         }
         if (!in_legit) return false; // 关键函数不在合法系统库映射内 = GOT/PLT 劫持
+    }
+    return true;
+}
+
+// ---------- G1: libc 关键函数页 disk-vs-memory 比对（MASTG-KNOW-0032 / RiskEngine） ----------
+// 直接字节比对，不依赖 trampoline 模式/脏页语义：任何 inline hook（无论跳板形态）
+// 都会改内存字节 → memcmp 不等 → arm。dlsym 地址 → 页对齐 → 由 maps 文件 offset
+// 推算磁盘偏移 → pread 磁盘页 vs 内存页。连续 2 次命中才 arm 防误报。
+static int g_libctxt_hit = 0;
+bool libc_text_check() {
+    if (!g_cfg.enable_libctxt) return true;
+    std::string maps;
+    if (!syscall_read_proc("/proc/self/maps", maps)) return true; // 读失败放行
+    long psz = ::sysconf(_SC_PAGESIZE);
+    if (psz <= 0) return true;
+    const char* names[] = { "fork", "open", "read", "write", "close",
+                            "ptrace", "connect", "recvfrom", "signal", "mmap" };
+    bool suspicious = false;
+    for (auto* n : names) {
+        void* fn = ::dlsym(RTLD_DEFAULT, n);
+        if (!fn) continue; // 取不到放行（保守）
+        uintptr_t addr = reinterpret_cast<uintptr_t>(fn);
+        uintptr_t vpage = addr & ~(static_cast<uintptr_t>(psz) - 1);
+        // 在 maps 中找地址所在文件映射（r-x .so）——path 拷贝到独立 string 防悬垂
+        std::string libpath;
+        uintptr_t seg_start = 0;
+        unsigned long long file_off = 0;
+        size_t pos = 0;
+        while (pos < maps.size()) {
+            size_t eol = maps.find('\n', pos);
+            if (eol == std::string::npos) eol = maps.size();
+            std::string line = maps.substr(pos, eol - pos);
+            pos = eol + 1;
+            unsigned long long start = 0, end = 0, off = 0;
+            if (sscanf(line.c_str(), "%llx-%llx %*s %llx", &start, &end, &off) != 3) continue;
+            if (addr < start || addr >= end) continue;
+            if (line.find("r-xp") == std::string::npos && line.find("r-x ") == std::string::npos) break;
+            size_t sp = line.rfind(' ');
+            std::string path = (sp == std::string::npos) ? "" : line.substr(sp + 1);
+            if (path.find(".so") == std::string::npos) break;
+            // 页须整体落在段内（防页跨越段边界时 offset 错位）
+            uintptr_t seg_end_page = static_cast<uintptr_t>(end) & ~(static_cast<uintptr_t>(psz) - 1);
+            if (vpage < start || vpage >= seg_end_page) break;
+            // 私有文件映射（frida 注入的 .so 也带路径）——进一步要求系统库前缀
+            if (!(path.find("/system/") == 0 || path.find("/apex/") == 0 ||
+                  path.find("/vendor/") == 0 || path.find("/odm/") == 0 ||
+                  path.find("/product/") == 0 || path.find("/linkerconfig/") == 0)) break;
+            libpath = path; // 拷贝（line 是循环局部变量，不能持有其 c_str）
+            seg_start = static_cast<uintptr_t>(start);
+            file_off = off;
+            break;
+        }
+        if (libpath.empty()) continue; // 不在系统库 r-x 段（F3 已管 GOT 落点；此处放行）
+        // 磁盘偏移 = 段文件 offset + (页虚拟地址 - 段起始虚拟地址)
+        uintptr_t rel = vpage - seg_start;
+        off_t foff = static_cast<off_t>(file_off) + static_cast<off_t>(rel);
+        // 打开磁盘文件（syscall 直读，抗 libc hook 干扰本检测）
+        int fd = static_cast<int>(::syscall(SYS_openat, AT_FDCWD, libpath.c_str(), O_RDONLY));
+        if (fd < 0) continue; // 打不开放行（保守）
+        unsigned char disk[16384];
+        ssize_t r = ::syscall(SYS_pread64, fd, disk, static_cast<size_t>(psz), foff);
+        ::syscall(SYS_close, fd);
+        if (r != static_cast<ssize_t>(psz)) continue;
+        // 内存页 vs 磁盘页
+        const volatile unsigned char* mem = reinterpret_cast<const volatile unsigned char*>(vpage);
+        bool diff = false;
+        for (long i = 0; i < psz; i++) {
+            if (mem[i] != disk[i]) { diff = true; break; }
+        }
+        if (diff) { suspicious = true; break; } // 任一关键函数页被改 = hook
+    }
+    if (suspicious) {
+        if (++g_libctxt_hit >= 2) { g_libctxt_hit = 0; return false; } // 连续 2 次命中才 arm
+    } else {
+        g_libctxt_hit = 0;
     }
     return true;
 }
