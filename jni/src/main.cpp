@@ -86,6 +86,8 @@ static void slow_security_check() {
     // G1（MASTG-KNOW-0032 / RiskEngine 思路）：libc 关键函数页 disk-vs-memory 比对
     //   （每轮 pread 10 个函数页 40KB，开销可接受；直接字节比对抓一切 inline hook）
     if (!anti_extra::libc_text_check()) { anti_extra::arm_detected(); return; }
+    // I1：ELF header/phdr 完整性（L1.6 只覆盖可执行段，header 区域此处置兜底）
+    if (!anti_extra::elf_header_check()) { anti_extra::arm_detected(); return; }
 }
 
 // L1.15: 独立检测线程——时序分层（环境变量 SEC_FAST_INTV / SEC_SLOW_INTV 可调）：

@@ -33,6 +33,7 @@ namespace anti_extra {
 //   SEC_GOT=0/1           F3   GOT/PLT 劫持检测（默认开）
 //   SEC_LIBCTXT=0/1       G1   libc 关键函数页 disk-vs-memory 比对（默认开）
 //   SEC_VTBL=0/1          H1   vtable 函数指针完整性检测（默认开）
+//   SEC_ELFHDR=0/1        I1   ELF header/phdr 完整性（默认开）
 struct SecurityConfig {
     bool enable_injected   = true;
     bool enable_memfd      = true;
@@ -55,6 +56,7 @@ struct SecurityConfig {
     bool enable_got        = true;  // F3: GOT/PLT 劫持检测
     bool enable_libctxt    = true;  // G1: libc 关键函数页 disk-vs-memory 比对
     bool enable_vtbl       = true;  // H1: vtable 函数指针完整性检测
+    bool enable_elfhdr     = true;  // I1: ELF header/phdr 完整性
     int  delay_min = 20;          // L1.14 延迟退出窗口下限(秒)
     int  delay_max = 90;          // L1.14 延迟退出窗口上限(秒)
     int  thread_baseline = -1;    // L1.17 线程基线（-1=未定，首个周期自动设定）
@@ -111,6 +113,12 @@ bool libc_text_check();
 //     纯匿名 r-x 段（取证确认正常环境此类段=0）→ vtable/函数指针被 hook。
 //     ≥2 命中才 arm。返回 true=干净。
 bool vtable_hook_check();
+
+// I1: ELF header + program headers 完整性（disk vs memory）。
+//     L1.6 只比对可执行段（r-xp）；ELF 文件头 + phdr 在 offset 0 的 r--p 段——
+//     攻击者改 e_entry/phdr 权限/删 RELRO flag 不被 L1.6 覆盖。此处比对 offset 0
+//     段内存 vs 磁盘（syscall 直读），连续 2 次命中才 arm。返回 true=干净。
+bool elf_header_check();
 
 // L1.13: 行为型注入检测（不依赖特征串，针对魔改版 Frida）。
 //         可执行段必须属于：自身 / [vdso] / 系统白名单前缀；

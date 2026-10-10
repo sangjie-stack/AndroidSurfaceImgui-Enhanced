@@ -106,6 +106,7 @@ void load_sec_cfg_from_env() {
     g_cfg.enable_got        = env_bool("SEC_GOT", true);         // F3
     g_cfg.enable_libctxt    = env_bool("SEC_LIBCTXT", true);     // G1
     g_cfg.enable_vtbl       = env_bool("SEC_VTBL", true);        // H1
+    g_cfg.enable_elfhdr     = env_bool("SEC_ELFHDR", true);      // I1
     int lo = g_cfg.delay_min, hi = g_cfg.delay_max;
     if (parse_range(::getenv("SEC_DELAY"), lo, hi)) { g_cfg.delay_min = lo; g_cfg.delay_max = hi; }
     int base = env_int("SEC_THRDBASE", -1);
@@ -1785,6 +1786,71 @@ bool vtable_hook_check() {
         if (++g_vtbl_hit >= 2) { g_vtbl_hit = 0; return false; } // 连续 2 轮都命中才 arm
     } else {
         g_vtbl_hit = 0;
+    }
+    return true;
+}
+
+// ---------- I1: ELF header + program headers 完整性（disk vs memory） ----------
+// L1.6 只比对可执行段（r-xp）；ELF 文件头 + phdr 位于 offset 0 的 r--p 段，攻击者
+// 改 e_entry / phdr 权限 / 删 RELRO flag 等篡改不被 L1.6 覆盖。此处比对 offset 0
+// 段（加载基址起 4KB，覆盖 ehdr+phdr）内存 vs 磁盘，syscall 直读，连续 2 次命中才 arm。
+static int g_elfhdr_hit = 0;
+bool elf_header_check() {
+    if (!g_cfg.enable_elfhdr) return true;
+    char selfpath[512];
+    ssize_t n = readlink("/proc/self/exe", selfpath, sizeof(selfpath) - 1);
+    if (n <= 0) return true; // 读不到放行（保守）
+    selfpath[n] = '\0';
+    std::string self(selfpath);
+    std::string self_base = self.substr(self.rfind('/') + 1);
+    std::string maps;
+    if (!syscall_read_proc("/proc/self/maps", maps)) return true;
+    // 找自身文件映射中 offset==0 的段（ELF header + phdr 所在，r--p）
+    uintptr_t seg_start = 0;
+    size_t seg_len = 0;
+    size_t pos = 0;
+    while (pos < maps.size()) {
+        size_t eol = maps.find('\n', pos);
+        if (eol == std::string::npos) eol = maps.size();
+        std::string line = maps.substr(pos, eol - pos);
+        pos = eol + 1;
+        unsigned long long start = 0, end = 0, off = 0;
+        if (sscanf(line.c_str(), "%llx-%llx %*s %llx", &start, &end, &off) != 3) continue;
+        if (off != 0) continue;
+        size_t sp = line.rfind(' ');
+        std::string path = (sp == std::string::npos) ? "" : line.substr(sp + 1);
+        size_t pb = path.find_first_not_of(" \t");
+        if (pb == std::string::npos) continue;
+        path = path.substr(pb);
+        if (path.empty()) continue;
+        bool match = (path == self);
+        if (!match) {
+            size_t lp = path.rfind('/');
+            std::string path_base = (lp == std::string::npos) ? path : path.substr(lp + 1);
+            match = (path_base == self_base);
+        }
+        if (!match) continue;
+        seg_start = static_cast<uintptr_t>(start);
+        seg_len = static_cast<size_t>(end - start);
+        break;
+    }
+    if (!seg_start || seg_len == 0) return true; // 找不到放行
+    size_t cmp_len = seg_len < 4096 ? seg_len : 4096; // ehdr+phdr 必在 4KB 内
+    int fd = static_cast<int>(::syscall(SYS_openat, AT_FDCWD, self.c_str(), O_RDONLY));
+    if (fd < 0) return true;
+    unsigned char disk[4096];
+    ssize_t r = ::syscall(SYS_pread64, fd, disk, cmp_len, 0);
+    ::syscall(SYS_close, fd);
+    if (r != static_cast<ssize_t>(cmp_len)) return true; // 读不完整放行（保守）
+    const volatile unsigned char* mem = reinterpret_cast<const volatile unsigned char*>(seg_start);
+    bool diff = false;
+    for (size_t i = 0; i < cmp_len; i++) {
+        if (mem[i] != disk[i]) { diff = true; break; }
+    }
+    if (diff) {
+        if (++g_elfhdr_hit >= 2) { g_elfhdr_hit = 0; return false; } // 连续 2 次命中才 arm
+    } else {
+        g_elfhdr_hit = 0;
     }
     return true;
 }
