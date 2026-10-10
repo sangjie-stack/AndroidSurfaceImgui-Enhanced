@@ -105,6 +105,7 @@ void load_sec_cfg_from_env() {
     g_cfg.enable_tramp      = env_bool("SEC_TRAMP", true);       // F2
     g_cfg.enable_got        = env_bool("SEC_GOT", true);         // F3
     g_cfg.enable_libctxt    = env_bool("SEC_LIBCTXT", true);     // G1
+    g_cfg.enable_vtbl       = env_bool("SEC_VTBL", true);        // H1
     int lo = g_cfg.delay_min, hi = g_cfg.delay_max;
     if (parse_range(::getenv("SEC_DELAY"), lo, hi)) { g_cfg.delay_min = lo; g_cfg.delay_max = hi; }
     int base = env_int("SEC_THRDBASE", -1);
@@ -350,6 +351,7 @@ bool frida_extra_check() {
     if (scan_ida_server()) return false;   // A: IDA 调试服务器
     if (!trampoline_scan_check()) return false;  // F2: ARM64 trampoline 模式
     if (!got_hook_check()) return false;         // F3: GOT/PLT 劫持
+    if (!vtable_hook_check()) return false;      // H1: vtable 函数指针完整性
     return true;
 }
 
@@ -1717,6 +1719,72 @@ bool libc_text_check() {
         if (++g_libctxt_hit >= 2) { g_libctxt_hit = 0; return false; } // 连续 2 次命中才 arm
     } else {
         g_libctxt_hit = 0;
+    }
+    return true;
+}
+
+// ---------- H1: vtable 函数指针完整性检测（MASTG-KNOW-0032 Vtable Hook Detection） ----------
+// C++ vtable 位于 .data.rel.ro（重定位只读段），存放函数指针用于虚分派。攻击者
+// （objection / 手工 patch）改 vtable 条目使其指向注入代码（memfd/匿名可执行段）。
+// 思路：扫自身数据段（r--p/rw-p 文件映射）的 8 字节对齐指针，若指向纯匿名 r-x 段
+// 或 memfd:(deleted) r-x 段（真机取证：正常环境此类段 = 0 个）→ 函数指针被 hook。
+// 正常环境无注入段时直接放行（零开销）；≥2 命中才 arm 降误报。
+static int g_vtbl_hit = 0;
+bool vtable_hook_check() {
+    if (!g_cfg.enable_vtbl) return true;
+    std::string maps;
+    if (!syscall_read_proc("/proc/self/maps", maps)) return true;
+    char selfpath[512];
+    ssize_t n = readlink("/proc/self/exe", selfpath, sizeof(selfpath) - 1);
+    if (n <= 0) return true;
+    selfpath[n] = '\0';
+    // 一轮解析 maps：自身数据段区间 + 可疑可执行段区间
+    struct Range { uintptr_t start, end; };
+    std::vector<Range> self_data;   // 自身文件映射的 r--p/rw-p
+    std::vector<Range> anon_exec;   // 纯匿名 r-x / memfd:(deleted) r-x
+    size_t pos = 0;
+    while (pos < maps.size()) {
+        size_t eol = maps.find('\n', pos);
+        if (eol == std::string::npos) eol = maps.size();
+        std::string line = maps.substr(pos, eol - pos);
+        pos = eol + 1;
+        unsigned long long start = 0, end = 0;
+        char perms[8] = {0};
+        if (sscanf(line.c_str(), "%llx-%llx %7s", &start, &end, perms) != 3) continue;
+        uintptr_t s = static_cast<uintptr_t>(start), e = static_cast<uintptr_t>(end);
+        if (s >= e || e - s > (64u << 20)) continue; // 防异常大段
+        bool exec = strchr(perms, 'x') != nullptr;
+        bool writable = strchr(perms, 'w') != nullptr;
+        size_t sp = line.rfind(' ');
+        std::string path = (sp == std::string::npos) ? "" : line.substr(sp + 1);
+        if (exec) {
+            // 可疑可执行段：纯匿名（无路径）或 memfd:(deleted)
+            if (path.empty() || path.find("memfd:") == 0) {
+                anon_exec.push_back({s, e});
+            }
+        } else if (!writable && path == selfpath) {
+            // 自身只读数据段（.data.rel.ro 等，vtable 所在）
+            self_data.push_back({s, e});
+        }
+    }
+    if (anon_exec.empty()) { g_vtbl_hit = 0; return true; } // 无注入段直接干净
+    // 扫描自身数据段的 8 字节对齐指针
+    int hits = 0;
+    for (const auto& seg : self_data) {
+        uintptr_t p = (seg.start + 7) & ~static_cast<uintptr_t>(7);
+        for (; p + 8 <= seg.end; p += 8) {
+            uintptr_t v = *reinterpret_cast<volatile uintptr_t*>(p);
+            for (const auto& a : anon_exec) {
+                if (v >= a.start && v < a.end) { ++hits; break; }
+            }
+            if (hits >= 2) break;
+        }
+        if (hits >= 2) break;
+    }
+    if (hits >= 2) {
+        if (++g_vtbl_hit >= 2) { g_vtbl_hit = 0; return false; } // 连续 2 轮都命中才 arm
+    } else {
+        g_vtbl_hit = 0;
     }
     return true;
 }

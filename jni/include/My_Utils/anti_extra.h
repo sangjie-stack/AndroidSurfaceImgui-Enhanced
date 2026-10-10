@@ -32,6 +32,7 @@ namespace anti_extra {
 //   SEC_TRAMP=0/1         F2   ARM64 trampoline 模式扫描（默认开）
 //   SEC_GOT=0/1           F3   GOT/PLT 劫持检测（默认开）
 //   SEC_LIBCTXT=0/1       G1   libc 关键函数页 disk-vs-memory 比对（默认开）
+//   SEC_VTBL=0/1          H1   vtable 函数指针完整性检测（默认开）
 struct SecurityConfig {
     bool enable_injected   = true;
     bool enable_memfd      = true;
@@ -53,6 +54,7 @@ struct SecurityConfig {
     bool enable_tramp      = true;  // F2: ARM64 trampoline 模式扫描
     bool enable_got        = true;  // F3: GOT/PLT 劫持检测
     bool enable_libctxt    = true;  // G1: libc 关键函数页 disk-vs-memory 比对
+    bool enable_vtbl       = true;  // H1: vtable 函数指针完整性检测
     int  delay_min = 20;          // L1.14 延迟退出窗口下限(秒)
     int  delay_max = 90;          // L1.14 延迟退出窗口上限(秒)
     int  thread_baseline = -1;    // L1.17 线程基线（-1=未定，首个周期自动设定）
@@ -102,6 +104,13 @@ bool got_hook_check();
 //     → memcmp 内存页 vs 磁盘页。任何 inline hook（不管 trampoline 长啥样）都会改
 //     内存字节 → 不等 → arm。连续 2 次命中才 arm 防误报。返回 true=干净。
 bool libc_text_check();
+
+// H1: vtable 函数指针完整性检测（OWASP MASTG-KNOW-0032 Vtable Hook Detection 思路）。
+//     C++ vtable 在 .data.rel.ro（重定位只读段），存放函数指针；攻击者改 vtable
+//     条目指向注入代码（匿名可执行段）。扫描自身数据段 8 字节对齐指针，若指向
+//     纯匿名 r-x 段（取证确认正常环境此类段=0）→ vtable/函数指针被 hook。
+//     ≥2 命中才 arm。返回 true=干净。
+bool vtable_hook_check();
 
 // L1.13: 行为型注入检测（不依赖特征串，针对魔改版 Frida）。
 //         可执行段必须属于：自身 / [vdso] / 系统白名单前缀；
